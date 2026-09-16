@@ -89,10 +89,45 @@ pub(crate) fn lzma_decoder<R: Read>(
 /// `decoder.rs` already asks the question, and so the multi-threaded reader
 /// slots in here rather than in a `match` somewhere else.
 ///
-/// When `lzma-fast`'s parallel reader lands, this grows a
-/// `Parallel { source: <seekable pack-stream view>, threads, memory_limit }`
-/// variant and [`lzma2_decoder`] grows a sibling that takes `Read + Seek`.
-/// `docs/lzma-fast-requests.md` has the signatures that were asked for.
+/// # The adapter point for multi-threaded LZMA2
+///
+/// This is the seam, and it is deliberately the whole of it. When
+/// `lzma-fast`'s parallel reader lands, this enum grows one variant:
+///
+/// ```ignore
+/// pub(crate) enum Lzma2Plan<S> {
+///     SingleThreaded,
+///     Parallel {
+///         /// The block's packed stream as a seekable view — this crate knows
+///         /// its absolute range from `Archive::block_pack_streams`, so the
+///         /// parallel decoder can read runs out of order without a second
+///         /// open file.
+///         source: S,
+///         /// Workers to use. Already clamped to 1..=256 by the reader.
+///         threads: NonZeroU32,
+///         /// Ceiling on what the decode may allocate. A parallel LZMA2
+///         /// decode buffers a whole dependent run, so this is not the
+///         /// dictionary-based number `Archive::decoder_memory_estimate`
+///         /// reports, and it has to be enforced rather than assumed.
+///         memory_limit: u64,
+///     },
+/// }
+/// ```
+///
+/// and [`lzma2_decoder`] grows a sibling that takes `Read + Seek`. Two
+/// properties of that design are load-bearing and are stated as requirements
+/// in `docs/lzma-fast-requests.md`: the output stays *in order* (the coder
+/// above it in the chain is a plain `Read`), and the choice between modes is
+/// *lossless and revisable while decoding* — whether a stream can be decoded
+/// in parallel depends on how the encoder chunked it, which is not visible in
+/// the coder properties, so the reader starts single-threaded and widens at a
+/// run boundary rather than failing on a stream that turns out to be one
+/// dependent run.
+///
+/// Nothing else in this crate needs to change for that: `decoder.rs` already
+/// asks this question, and the archive-level plumbing that supplies the pack
+/// range, the thread count and the memory limit already exists
+/// ([`crate::ArchiveLimits`], [`crate::Archive::block_pack_streams`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Lzma2Plan {
     /// One dependent stream decoded on the calling thread.

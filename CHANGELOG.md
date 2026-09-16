@@ -60,6 +60,51 @@ against. Upstream's own changelog continues below, unchanged.
 - The LZMA coder's properties are length-checked before being sliced, instead
   of panicking on a short field.
 
+### Container API (additions only)
+
+Everything here is new surface; no upstream signature changed meaning.
+
+- `ArchiveLimits { memory_limit_bytes, max_end_header_bytes }`, with
+  `ArchiveReader::with_limits`, `Archive::read_with_limits` and
+  `BlockDecoder::with_limits`. Both limits are checked *before* the allocation
+  they bound: the declared end-header size before the header is buffered
+  (`Error::EndHeaderTooLarge`), and `Archive::decoder_memory_estimate` before
+  any decoder is built (`Error::MemoryLimited`). The memory limit then bounds
+  each coder as it is constructed, replacing the crate's own effectively
+  unlimited constant.
+- `Archive::decoder_memory_estimate() -> Result<u64, UnsizedCoder>` and
+  `coder_memory_estimate(&Coder)`: what a single-threaded decode of the archive
+  needs, as the largest block's coder chain. The per-coder table is in the
+  rustdoc.
+- Read-only views of what the header already parsed:
+  `Archive::num_unpack_sub_streams()`, `Archive::sub_stream(index)`,
+  `Archive::block_sub_streams(block)` (per-entry size and CRC-32),
+  `Archive::block_pack_streams(block)` (absolute `(offset, size)` ranges, four
+  of them for a BCJ2 block) and `Archive::block_coders(block)`.
+- `ArchiveReader::block_decoder(block_index)` borrows the reader instead of
+  consuming it, so a consumer parses the header once and decodes blocks from
+  the same source; `source_mut()` and `into_source()` complete that. This is
+  what replaces opening the archive twice because the constructor took
+  ownership.
+- `ArchiveReader::set_block_complete_hook` / `clear_block_complete_hook`,
+  called with a `BlockCompletion { block_index, unpacked_size, crc_verified }`
+  once a block has been decoded in full and its checksum verified. A block the
+  caller stopped short of is not reported.
+- `Error::BlockDecode { block_index, packed_offset, kind, message }` with
+  `BlockErrorKind::{Corrupted, ChecksumMismatch, UnsupportedMethod, Io,
+  Password}`: corruption now says which block and which byte range, distinctly
+  from an I/O failure on the source or a method this build cannot decode. An
+  error raised by the *caller's* own callback is passed through untouched — the
+  decode chain is wrapped so the two can be told apart.
+
+### Documentation
+
+- `docs/benchmarking.md` — the harness, the acceptance gate and the numbers.
+- `docs/lzma-fast-requests.md` — the API this crate would like from
+  `lzma-fast`, with the exact signatures and the local work-around for each:
+  the parallel LZMA2 reader and its seven constraints, an AES-256-CBC
+  encryptor, and `sevenz_key` over a caller-chosen digest.
+
 ### Cryptography
 
 - AES-256-CBC and SHA-256 for the `aes256` coder now come from `lzma-fast`'s

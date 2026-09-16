@@ -34,6 +34,23 @@ Measured numbers live in [docs/benchmarking.md](docs/benchmarking.md).
 
 ### 2. Container API a streaming consumer needs
 
+A consumer that feeds this reader from a download, under a memory budget it has
+to honour before it allocates, needs to ask the archive a few things first:
+
+- `ArchiveReader::with_limits` refuses an archive over an `ArchiveLimits`
+  before the allocation it bounds — the declared end-header size before the
+  header is buffered, and `Archive::decoder_memory_estimate()` before a
+  decoder is built.
+- `Archive::block_pack_streams(block)` gives absolute `(offset, size)` ranges,
+  `Archive::block_sub_streams(block)` the per-entry sizes and CRC-32s.
+- `ArchiveReader::block_decoder(block)` borrows the reader rather than
+  consuming it, so the header is parsed once and blocks are decoded from the
+  same source.
+- `ArchiveReader::set_block_complete_hook` reports each block once it is
+  decoded and verified.
+- `Error::BlockDecode` names the block and the packed offset for a corrupt
+  archive, distinctly from I/O and unsupported-method failures.
+
 Added, never altered — every upstream signature still means what it did. See
 [CHANGELOG.md](CHANGELOG.md), section `## Fork`, for the exhaustive list of
 divergences, and [AGENTS.md](AGENTS.md) for how the fork is rebased onto

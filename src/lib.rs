@@ -47,6 +47,7 @@
 #[cfg(target_arch = "wasm32")]
 extern crate wasm_bindgen;
 
+pub mod container;
 #[cfg(feature = "aes256")]
 mod crypto_backend;
 #[cfg(feature = "compress")]
@@ -91,8 +92,11 @@ use std::{
 
 pub use archive::*;
 pub use block::*;
+pub use container::{
+    ArchiveLimits, BlockCompletion, PackStreamRange, SubStream, UnsizedCoder, coder_memory_estimate,
+};
 pub use encryption::Password;
-pub use error::Error;
+pub use error::{BlockErrorKind, Error};
 pub use reader::{ArchiveReader, BlockDecoder};
 pub use time::NtTime;
 #[cfg(all(feature = "compress", feature = "util", not(target_arch = "wasm32")))]

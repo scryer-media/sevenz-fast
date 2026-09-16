@@ -1,5 +1,5 @@
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::HashMap,
     fs::File,
     io,
@@ -11,11 +11,15 @@ use std::{
 use lzma_fast::crc::{Crc32, crc32};
 
 use crate::{
-    ByteReader, Password, archive::*, bitset::BitSet, block::*, codec::filter::bcj2::Bcj2Reader,
-    decoder::add_decoder, error::Error,
+    ByteReader, Password,
+    archive::*,
+    bitset::BitSet,
+    block::*,
+    codec::filter::bcj2::Bcj2Reader,
+    container::{ArchiveLimits, BlockCompletion},
+    decoder::add_decoder,
+    error::Error,
 };
-
-const MAX_MEM_LIMIT_KB: usize = usize::MAX / 1024;
 
 /// Upper bound for eagerly pre-allocating an output buffer from an archive-declared
 /// (untrusted) uncompressed size. The buffer still grows to the real size as data is
@@ -109,6 +113,24 @@ impl<'a, R: Read + Seek> SharedBoundedReader<'a, R> {
     }
 }
 
+/// Wraps the decode chain so that a failure can be told apart from a failure
+/// in the caller's own callback.
+///
+/// An entry is handed to the caller as a `&mut dyn Read`; when the caller then
+/// returns an error there is otherwise no way to know whether the archive was
+/// damaged or the caller's own sink failed, and only the first of those may be
+/// reported as a block failure.
+struct FaultRecordingReader<R> {
+    inner: R,
+    faulted: Rc<Cell<bool>>,
+}
+
+impl<R: Read> Read for FaultRecordingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.read(buf).inspect_err(|_| self.faulted.set(true))
+    }
+}
+
 struct Crc32VerifyingReader<R> {
     inner: R,
     crc_digest: Crc32,
@@ -194,6 +216,26 @@ impl Archive {
     /// }
     /// ```
     pub fn read<R: Read + Seek>(reader: &mut R, password: &Password) -> Result<Archive, Error> {
+        Self::read_with_limits(reader, password, &ArchiveLimits::default())
+    }
+
+    /// Reads the archive's header under `limits`.
+    ///
+    /// The one limit that has to be applied here rather than by the caller is
+    /// [`ArchiveLimits::max_end_header_bytes`]: the declared end-header size is
+    /// read out of the archive's first 32 bytes and the header is buffered in
+    /// full in order to parse it, so checking the size afterwards is checking
+    /// nothing. An archive that declares more is refused with
+    /// [`Error::EndHeaderTooLarge`] before the allocation.
+    ///
+    /// # Errors
+    ///
+    /// Anything [`Archive::read`] raises, plus [`Error::EndHeaderTooLarge`].
+    pub fn read_with_limits<R: Read + Seek>(
+        reader: &mut R,
+        password: &Password,
+        limits: &ArchiveLimits,
+    ) -> Result<Archive, Error> {
         let reader_len = reader.seek(SeekFrom::End(0))?;
         reader.seek(SeekFrom::Start(0))?;
 
@@ -226,9 +268,9 @@ impl Archive {
         };
         if header_valid {
             let start_header = Self::read_start_header(reader, start_header_crc)?;
-            Self::init_archive(reader, start_header, password, true, 1)
+            Self::init_archive(reader, start_header, password, true, 1, limits)
         } else {
-            Self::try_to_locale_end_header(reader, reader_len, password, 1)
+            Self::try_to_locale_end_header(reader, reader_len, password, 1, limits)
         }
     }
 
@@ -300,6 +342,7 @@ impl Archive {
         reader_len: u64,
         password: &Password,
         thread_count: u32,
+        limits: &ArchiveLimits,
     ) -> Result<Self, Error> {
         let search_limit = 1024 * 1024;
         let prev_data_size = reader.stream_position()? + 20;
@@ -326,8 +369,14 @@ impl Archive {
                     next_header_size: reader_len - pos,
                     next_header_crc: 0,
                 };
-                let result =
-                    Self::init_archive(reader, start_header, password, false, thread_count)?;
+                let result = Self::init_archive(
+                    reader,
+                    start_header,
+                    password,
+                    false,
+                    thread_count,
+                    limits,
+                )?;
 
                 if !result.files.is_empty() {
                     return Ok(result);
@@ -345,7 +394,17 @@ impl Archive {
         password: &Password,
         verify_crc: bool,
         thread_count: u32,
+        limits: &ArchiveLimits,
     ) -> Result<Self, Error> {
+        // The caller's own bound comes first: this number is read out of the
+        // archive's first 32 bytes and the header below is buffered in full.
+        if start_header.next_header_size > limits.max_end_header_bytes {
+            return Err(Error::EndHeaderTooLarge {
+                limit_bytes: limits.max_end_header_bytes,
+                declared_bytes: start_header.next_header_size,
+            });
+        }
+
         // Bound the declared next-header size against the actual file length before allocating.
         let reader_len = reader.seek(SeekFrom::End(0))?;
         if start_header.next_header_size > usize::MAX as u64
@@ -385,6 +444,7 @@ impl Archive {
                 password,
                 next_header_size_int,
                 thread_count,
+                limits,
             )?;
             // Read the decoded header lazily instead of pre-allocating `buf_size` bytes:
             // a crafted encoded header can declare a huge unpack size, and `resize`
@@ -436,6 +496,7 @@ impl Archive {
         password: &Password,
         limit: usize,
         thread_count: u32,
+        limits: &ArchiveLimits,
     ) -> Result<(Box<dyn Read + 'r>, usize), Error> {
         Self::read_streams_info(header, archive, limit)?;
         let block = archive
@@ -468,7 +529,7 @@ impl Archive {
                     block.get_unpack_size_at_index(index) as usize,
                     coder,
                     password,
-                    MAX_MEM_LIMIT_KB,
+                    limits.memory_limit_kb(),
                     thread_count,
                 )?;
                 decoder = Box::new(next);
@@ -1256,6 +1317,9 @@ pub struct ArchiveReader<R: Read + Seek> {
     password: Password,
     thread_count: u32,
     index: HashMap<String, IndexEntry>,
+    limits: ArchiveLimits,
+    #[allow(clippy::type_complexity)]
+    on_block_complete: Option<Box<dyn FnMut(BlockCompletion) + Send>>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1272,8 +1336,53 @@ impl ArchiveReader<File> {
 impl<R: Read + Seek> ArchiveReader<R> {
     /// Creates a [`ArchiveReader`] to read a 7z archive file from the given `source` reader.
     #[inline]
-    pub fn new(mut source: R, password: Password) -> Result<Self, Error> {
-        let archive = Archive::read(&mut source, &password)?;
+    pub fn new(source: R, password: Password) -> Result<Self, Error> {
+        Self::with_limits(source, password, ArchiveLimits::default())
+    }
+
+    /// Creates an [`ArchiveReader`] that refuses an archive exceeding `limits`
+    /// *before* allocating for it.
+    ///
+    /// Two checks, both of which have to happen before an allocation rather
+    /// than after one, because both numbers come out of the archive:
+    ///
+    /// - the declared end-header size, against
+    ///   [`ArchiveLimits::max_end_header_bytes`], before the header is
+    ///   buffered ([`Error::EndHeaderTooLarge`]);
+    /// - [`Archive::decoder_memory_estimate`], against
+    ///   [`ArchiveLimits::memory_limit_bytes`], before any decoder is built
+    ///   ([`Error::MemoryLimited`]). The same limit then bounds each coder as
+    ///   it is constructed.
+    ///
+    /// An archive whose coder chain has no memory model is refused too when a
+    /// memory limit is set: a budget that cannot be computed has not been met.
+    ///
+    /// # Errors
+    ///
+    /// Anything [`ArchiveReader::new`] raises, plus the two above.
+    pub fn with_limits(
+        mut source: R,
+        password: Password,
+        limits: ArchiveLimits,
+    ) -> Result<Self, Error> {
+        let archive = Archive::read_with_limits(&mut source, &password, &limits)?;
+
+        if limits.memory_limit_bytes < u64::MAX {
+            match archive.decoder_memory_estimate() {
+                Ok(required_bytes) if required_bytes > limits.memory_limit_bytes => {
+                    return Err(Error::MemoryLimited {
+                        limit_bytes: limits.memory_limit_bytes,
+                        required_bytes,
+                    });
+                }
+                Ok(_) => {}
+                Err(unsized_coder) => {
+                    return Err(Error::UnsupportedCompressionMethod(
+                        unsized_coder.to_string(),
+                    ));
+                }
+            }
+        }
 
         let mut reader = Self {
             source,
@@ -1281,6 +1390,8 @@ impl<R: Read + Seek> ArchiveReader<R> {
             password,
             thread_count: 1,
             index: HashMap::default(),
+            limits,
+            on_block_complete: None,
         };
 
         reader.fill_index();
@@ -1290,6 +1401,72 @@ impl<R: Read + Seek> ArchiveReader<R> {
         reader.set_thread_count(thread_count.get() as u32);
 
         Ok(reader)
+    }
+
+    /// Calls `hook` each time a block has been decoded in full and its
+    /// checksum, if the archive records one, has been verified.
+    ///
+    /// A consumer that is streaming output somewhere else uses this to learn
+    /// that a region is settled without waiting for the whole archive, and
+    /// without inferring it from entry callbacks (an entry boundary is not a
+    /// block boundary, and in a solid archive a block's last entry is checked
+    /// only when the block's own CRC is).
+    ///
+    /// The hook never fires for a block that failed: a failure is an error
+    /// from the call that was decoding it.
+    pub fn set_block_complete_hook(&mut self, hook: impl FnMut(BlockCompletion) + Send + 'static) {
+        self.on_block_complete = Some(Box::new(hook));
+    }
+
+    /// Drops any hook set by [`ArchiveReader::set_block_complete_hook`].
+    pub fn clear_block_complete_hook(&mut self) {
+        self.on_block_complete = None;
+    }
+
+    /// The limits this reader was built with.
+    #[must_use]
+    pub fn limits(&self) -> ArchiveLimits {
+        self.limits
+    }
+
+    /// A decoder for one block, borrowing this reader rather than consuming it.
+    ///
+    /// This is what lets a consumer parse the header once and then decode
+    /// blocks from the same source: the header pass and the decode pass share
+    /// one [`Read`] + [`Seek`], instead of the caller having to hand out a
+    /// freshly opened reader per pass because the constructor took ownership.
+    /// The decoder carries this reader's thread count and limits.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::FileNotFound`] if `block_index` is past the last block.
+    pub fn block_decoder(&mut self, block_index: usize) -> Result<BlockDecoder<'_, R>, Error> {
+        if block_index >= self.archive.blocks.len() {
+            return Err(Error::FileNotFound);
+        }
+        Ok(BlockDecoder::with_limits(
+            self.thread_count,
+            block_index,
+            &self.archive,
+            &self.password,
+            &mut self.source,
+            self.limits,
+        ))
+    }
+
+    /// The source this reader is reading from.
+    ///
+    /// Seeking it moves the reader's own cursor; every decode seeks to the
+    /// block it wants first, so that is safe between calls, and is how a
+    /// caller shares one open file between the header pass and the decode
+    /// pass.
+    pub fn source_mut(&mut self) -> &mut R {
+        &mut self.source
+    }
+
+    /// Takes the source back, dropping the reader.
+    pub fn into_source(self) -> R {
+        self.source
     }
 
     /// Creates an [`ArchiveReader`] from an existing [`Archive`] instance.
@@ -1309,6 +1486,8 @@ impl<R: Read + Seek> ArchiveReader<R> {
             password,
             thread_count: 1,
             index: HashMap::default(),
+            limits: ArchiveLimits::default(),
+            on_block_complete: None,
         };
 
         reader.fill_index();
@@ -1357,10 +1536,18 @@ impl<R: Read + Seek> ArchiveReader<R> {
         block_index: usize,
         password: &Password,
         thread_count: u32,
+        limits: &ArchiveLimits,
     ) -> Result<(Box<dyn Read + 'r>, usize), Error> {
         let block = &archive.blocks[block_index];
         if block.total_input_streams > block.total_output_streams {
-            return Self::build_decode_stack2(source, archive, block_index, password, thread_count);
+            return Self::build_decode_stack2(
+                source,
+                archive,
+                block_index,
+                password,
+                thread_count,
+                limits,
+            );
         }
         let first_pack_stream_index = archive.stream_map.block_first_pack_stream_index[block_index];
         let block_offset = SIGNATURE_HEADER_SIZE
@@ -1403,7 +1590,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
                 block.get_unpack_size_at_index(index) as usize,
                 coder,
                 password,
-                MAX_MEM_LIMIT_KB,
+                limits.memory_limit_kb(),
                 thread_count,
             )?;
             decoder = Box::new(next);
@@ -1425,6 +1612,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
         block_index: usize,
         password: &Password,
         thread_count: u32,
+        limits: &ArchiveLimits,
     ) -> Result<(Box<dyn Read + 'r>, usize), Error> {
         const MAX_CODER_COUNT: usize = 32;
         let block = &archive.blocks[block_index];
@@ -1502,6 +1690,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
             main_coder_index,
             0,
             thread_count,
+            limits,
         )?;
         if block.has_crc {
             decoder = Box::new(Crc32VerifyingReader::new(
@@ -1516,6 +1705,11 @@ impl<R: Read + Seek> ArchiveReader<R> {
         ))
     }
 
+    // One more parameter than clippy likes, because the memory limit has to
+    // reach `add_decoder` at the bottom of a BCJ2 chain. Bundling upstream's
+    // five into a context struct would widen the diff against upstream for no
+    // gain.
+    #[allow(clippy::too_many_arguments)]
     fn get_in_stream<'r>(
         block: &Block,
         sources: &[SharedBoundedReader<'r, R>],
@@ -1524,6 +1718,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
         in_stream_index: usize,
         depth: usize,
         thread_count: u32,
+        limits: &ArchiveLimits,
     ) -> Result<Box<dyn Read + 'r>, Error>
     where
         R: 'r,
@@ -1553,9 +1748,15 @@ impl<R: Read + Seek> ArchiveReader<R> {
             index,
             depth,
             thread_count,
+            limits,
         )
     }
 
+    // One more parameter than clippy likes, because the memory limit has to
+    // reach `add_decoder` at the bottom of a BCJ2 chain. Bundling upstream's
+    // five into a context struct would widen the diff against upstream for no
+    // gain.
+    #[allow(clippy::too_many_arguments)]
     fn get_in_stream2<'r>(
         block: &Block,
         sources: &[SharedBoundedReader<'r, R>],
@@ -1564,6 +1765,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
         in_stream_index: usize,
         depth: usize,
         thread_count: u32,
+        limits: &ArchiveLimits,
     ) -> Result<Box<dyn Read + 'r>, Error>
     where
         R: 'r,
@@ -1597,6 +1799,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
                 start_index,
                 depth + 1,
                 thread_count,
+                limits,
             )?;
 
             let decoder = add_decoder(
@@ -1604,7 +1807,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
                 uncompressed_len,
                 coder,
                 password,
-                MAX_MEM_LIMIT_KB,
+                limits.memory_limit_kb(),
                 thread_count,
             )?;
             return Ok(Box::new(decoder));
@@ -1631,6 +1834,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
                     i,
                     depth + 1,
                     thread_count,
+                    limits,
                 )?);
             }
             return Ok(Box::new(Bcj2Reader::new(inputs, uncompressed_len as u64)));
@@ -1653,14 +1857,41 @@ impl<R: Read + Seek> ArchiveReader<R> {
     ) -> Result<(), Error> {
         let block_count = self.archive.blocks.len();
         for block_index in 0..block_count {
-            let forder_dec = BlockDecoder::new(
+            let block_decoder = BlockDecoder::with_limits(
                 self.thread_count,
                 block_index,
                 &self.archive,
                 &self.password,
                 &mut self.source,
+                self.limits,
             );
-            forder_dec.for_each_entries(&mut each)?;
+            let finished = block_decoder.for_each_entries(&mut each)?;
+
+            if let Some(hook) = self.on_block_complete.as_mut() {
+                // Only a block the caller let run to the end has been decoded
+                // and checked in full; a callback that stopped early leaves the
+                // rest of the block unread, and saying otherwise would be a
+                // completion claim nobody verified.
+                if finished {
+                    let block = &self.archive.blocks[block_index];
+                    let sub_streams = self.archive.block_sub_streams(block_index);
+                    let crc_verified = block.has_crc
+                        || (!sub_streams.is_empty()
+                            && sub_streams
+                                .iter()
+                                .all(|sub_stream| sub_stream.crc.is_some()));
+                    hook(BlockCompletion {
+                        block_index,
+                        unpacked_size: block.get_unpack_size(),
+                        crc_verified,
+                    });
+                }
+            }
+
+            // Upstream moves on to the next block when a callback returns
+            // `false`, and consumers rely on that; only the hook treats it as
+            // "this block was not decoded in full".
+            let _ = finished;
         }
         // decode empty files
         for file_index in 0..self.archive.files.len() {
@@ -1736,6 +1967,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
                     block_index,
                     &self.password,
                     self.thread_count,
+                    &self.limits,
                 )?;
 
                 let mut data = Vec::with_capacity((file.size as usize).min(MAX_PREALLOC_BYTES));
@@ -1802,6 +2034,7 @@ pub struct BlockDecoder<'a, R: Read + Seek> {
     archive: &'a Archive,
     password: &'a Password,
     source: &'a mut R,
+    limits: ArchiveLimits,
 }
 
 impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
@@ -1821,12 +2054,37 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
         password: &'a Password,
         source: &'a mut R,
     ) -> Self {
+        Self::with_limits(
+            thread_count,
+            block_index,
+            archive,
+            password,
+            source,
+            ArchiveLimits::default(),
+        )
+    }
+
+    /// Same as [`BlockDecoder::new`], with a bound on what the block's coders
+    /// may allocate.
+    ///
+    /// The header has already been parsed by the time a caller holds a
+    /// [`BlockDecoder`], so only the decoder-memory half of [`ArchiveLimits`]
+    /// applies here; it bounds each coder as it is built.
+    pub fn with_limits(
+        thread_count: u32,
+        block_index: usize,
+        archive: &'a Archive,
+        password: &'a Password,
+        source: &'a mut R,
+        limits: ArchiveLimits,
+    ) -> Self {
         Self {
             thread_count,
             block_index,
             archive,
             password,
             source,
+            limits,
         }
     }
 
@@ -1866,14 +2124,28 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
             archive,
             password,
             source,
+            limits,
         } = self;
-        let (mut block_reader, _size) = ArchiveReader::build_decode_stack(
+        // Where this block's packed bytes start, so a failure below can say
+        // which region of the file it was reading.
+        let packed_offset = archive
+            .block_pack_streams(block_index)
+            .first()
+            .map_or(0, |range| range.offset);
+        let (block_reader, _size) = ArchiveReader::build_decode_stack(
             source,
             archive,
             block_index,
             password,
             thread_count,
-        )?;
+            &limits,
+        )
+        .map_err(|error| error.in_block(block_index, packed_offset))?;
+        let faulted = Rc::new(Cell::new(false));
+        let mut block_reader = FaultRecordingReader {
+            inner: block_reader,
+            faulted: Rc::clone(&faulted),
+        };
         let start = archive.stream_map.block_first_file_index[block_index];
         let file_count = archive.blocks[block_index].num_unpack_sub_streams;
 
@@ -1889,9 +2161,19 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
                         file.crc,
                     ));
                 }
-                if !each(file, &mut decoder)
-                    .map_err(|e| e.maybe_bad_password(!self.password.is_empty()))?
-                {
+                let outcome = each(file, &mut decoder)
+                    .map_err(|e| e.maybe_bad_password(!self.password.is_empty()))
+                    .map_err(|e| {
+                        // Only a failure that came out of the decode chain is
+                        // this block's fault; the caller's own errors pass
+                        // through as they were raised.
+                        if faulted.get() {
+                            e.in_block(block_index, packed_offset)
+                        } else {
+                            e
+                        }
+                    })?;
+                if !outcome {
                     return Ok(false);
                 }
             } else {
