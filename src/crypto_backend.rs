@@ -1,13 +1,13 @@
-//! The one place that decides which implementation of SHA-256 and AES-256-CBC
-//! the 7z `aes256` coder uses.
+//! The one place that decides which implementation of SHA-256 the 7z `aes256`
+//! coder uses, and the crate's own AES-256-CBC.
 //!
-//! Two backends are available, both of them `lzma-fast`'s:
+//! Two SHA-256 backends are available, both of them `lzma-fast`'s:
 //!
 //! - **`aws-lc-crypto`** (on by default) — `aws-lc-rs` over AWS-LC. It is the
 //!   scryer-media house default, shared with `lzma-fast` and `rarpar`, and it
 //!   is what the numbers in `docs/benchmarking.md` were taken with.
-//! - **`native-crypto`** — the RustCrypto crates (`sha2`, `aes`, `cbc`), for
-//!   consumers who cannot have a C toolchain in their build.
+//! - **`native-crypto`** — RustCrypto's `sha2`, for consumers who cannot have
+//!   a C toolchain in their build.
 //!
 //! Cargo features are additive, so `native-crypto` cannot be expressed as
 //! "turns `aws-lc-crypto` off". Instead **`native-crypto` takes precedence**:
@@ -20,25 +20,43 @@
 //! choice, because "which cryptography is in my binary" is not something a
 //! crate should decide behind a consumer's back.
 //!
-//! Encryption (`compress` + `aes256`) is not routed through here: `lzma-fast`
-//! exposes only the decrypting half, since decryption is all a 7z *reader*
-//! needs, so the encoder in `encryption::aes` uses the RustCrypto `cbc`
-//! encryptor directly. `docs/lzma-fast-requests.md` asks for the encrypting
-//! counterpart; when it lands, the encoder moves here too.
+//! # AES-256-CBC is this crate's own, on both lanes
+//!
+//! `lzma-fast` used to expose AES-256-CBC and the 7z key derivation; it
+//! dropped both on purpose, because 7z cryptography is this crate's job and
+//! that crate is LZMA, LZMA2 and the xz container. So the block cipher lives
+//! here, over RustCrypto's `aes`/`cbc`, and it is *not* part of the backend
+//! choice above. Three reasons:
+//!
+//! - CBC in a 7z reader is inherently incremental — the packed stream arrives
+//!   in whatever pieces the layer below hands over — and `cbc::Decryptor`
+//!   carries the chaining state for free. AWS-LC's CBC API is one-shot and
+//!   would rebuild the key schedule on every call.
+//! - `aes` compiles to AES-NI on x86-64 and to the ARMv8 cryptography
+//!   extensions on aarch64, so the pure-Rust lane is the hardware lane too.
+//! - It keeps the feature switch about one thing (SHA-256), which is the only
+//!   place the two backends can disagree.
+//!
+//! The encoder (`compress` + `aes256`) uses `cbc::Encryptor` from the same
+//! crates, in `encryption::aes`.
+
+use aes::Aes256;
+use aes::cipher::{BlockModeDecrypt, KeyIvInit};
 
 #[cfg(all(feature = "aws-lc-crypto", not(feature = "native-crypto")))]
-pub(crate) use lzma_fast::crypto::awslc::{Aes256Cbc, Sha256};
+pub(crate) use lzma_fast::crypto::awslc::Sha256;
 #[cfg(feature = "native-crypto")]
-pub(crate) use lzma_fast::crypto::rustcrypto::{Aes256Cbc, Sha256};
+pub(crate) use lzma_fast::crypto::rustcrypto::Sha256;
 
 #[cfg(not(any(feature = "aws-lc-crypto", feature = "native-crypto")))]
 compile_error!(
-    "the `aes256` feature needs a cryptography backend: enable `aws-lc-crypto` \
+    "the `aes256` feature needs a SHA-256 backend: enable `aws-lc-crypto` \
      (the default, AWS-LC) or `native-crypto` (RustCrypto, no C toolchain)"
 );
 
-/// Which backend this build selected. Only used by tests and diagnostics, but
-/// a consumer wondering what is in their binary should be able to ask.
+/// Which SHA-256 backend this build selected. Only used by tests and
+/// diagnostics, but a consumer wondering what is in their binary should be
+/// able to ask.
 pub(crate) const BACKEND: &str = if cfg!(feature = "native-crypto") {
     "rustcrypto"
 } else {
@@ -47,6 +65,68 @@ pub(crate) const BACKEND: &str = if cfg!(feature = "native-crypto") {
 
 /// Size of an AES block, for callers that chunk their input.
 pub(crate) const AES_BLOCK_LEN: usize = 16;
+
+/// Size of an AES-256 key.
+pub(crate) const AES256_KEY_LEN: usize = 32;
+
+/// What can go wrong in the block cipher. Nothing here is a decode error of
+/// the archive's payload, so it is a type of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AesError {
+    /// The key was not 32 bytes.
+    KeyLength,
+    /// The initialisation vector was not 16 bytes.
+    IvLength,
+    /// The ciphertext was not a whole number of blocks.
+    BlockAlignment,
+}
+
+impl std::fmt::Display for AesError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::KeyLength => "an AES-256 key is 32 bytes",
+            Self::IvLength => "an AES initialisation vector is 16 bytes",
+            Self::BlockAlignment => "AES-CBC ciphertext is a whole number of 16-byte blocks",
+        })
+    }
+}
+
+impl std::error::Error for AesError {}
+
+/// Unpadded AES-256-CBC decryption.
+///
+/// The chaining state carries across calls, so a caller may decrypt a stream
+/// in whatever block-aligned pieces it has. 7z streams are never padded: the
+/// coder's declared unpacked size is what ends the decode.
+pub(crate) struct Aes256Cbc(cbc::Decryptor<Aes256>);
+
+impl std::fmt::Debug for Aes256Cbc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never print key or chaining state.
+        f.write_str("Aes256Cbc(..)")
+    }
+}
+
+impl Aes256Cbc {
+    /// A decryptor for `key` starting from `iv`.
+    pub(crate) fn new(key: &[u8], iv: &[u8]) -> Result<Self, AesError> {
+        let key: &[u8; AES256_KEY_LEN] = key.try_into().map_err(|_| AesError::KeyLength)?;
+        let iv: &[u8; AES_BLOCK_LEN] = iv.try_into().map_err(|_| AesError::IvLength)?;
+        Ok(Self(cbc::Decryptor::<Aes256>::new(key.into(), iv.into())))
+    }
+
+    /// Decrypts `data` in place and advances the chaining state.
+    pub(crate) fn decrypt(&mut self, data: &mut [u8]) -> Result<(), AesError> {
+        if !data.len().is_multiple_of(AES_BLOCK_LEN) {
+            return Err(AesError::BlockAlignment);
+        }
+        for block in data.chunks_exact_mut(AES_BLOCK_LEN) {
+            let block: &mut [u8; AES_BLOCK_LEN] = block.try_into().expect("exact chunk");
+            self.0.decrypt_block(block.into());
+        }
+        Ok(())
+    }
+}
 
 /// The shape both backends' SHA-256 share, so the key derivation can be
 /// written once and run against either one. `lzma-fast` exposes two concrete
@@ -180,29 +260,6 @@ mod tests {
                     (state >> 24) as u8
                 })
                 .collect()
-        }
-
-        #[test]
-        fn backends_agree_on_cbc() {
-            let key = sample(32, 11);
-            let iv = sample(16, 22);
-            for blocks in [1usize, 2, 5, 64] {
-                let plain = sample(blocks * 16, 33 + blocks as u64);
-
-                let mut a = plain.clone();
-                awslc::Aes256Cbc::new(&key, &iv)
-                    .expect("sized")
-                    .decrypt(&mut a)
-                    .expect("aligned");
-
-                let mut b = plain.clone();
-                rustcrypto::Aes256Cbc::new(&key, &iv)
-                    .expect("sized")
-                    .decrypt(&mut b)
-                    .expect("aligned");
-
-                assert_eq!(a, b, "backends disagree on {blocks} block(s)");
-            }
         }
 
         #[test]

@@ -26,20 +26,18 @@ default = ["aes256", "aws-lc-crypto", "bzip2", "compress", "ppmd", "util"]
 # wasm has no C toolchain, so it takes the RustCrypto backend.
 default_wasm = ["aes256_wasm", "native-crypto", "bzip2", "compress", "ppmd", "util"]
 nt-time = ["dep:nt-time"]
-aes256 = ["dep:getrandom"]
+aes256 = ["dep:getrandom", "dep:aes", "dep:cbc"]
 aes256_wasm = ["aes256", "getrandom/wasm_js"]
-# Cryptography backends for `aes256`. See `src/crypto_backend.rs`: the features
-# are additive, so `native-crypto` does not turn `aws-lc-crypto` off — it takes
+# SHA-256 backends for `aes256`. See `src/crypto_backend.rs`: the features are
+# additive, so `native-crypto` does not turn `aws-lc-crypto` off — it takes
 # precedence over it. A build that wants no AWS-LC asks for
 # `default-features = false` plus `native-crypto`. Enabling `aes256` with
-# neither is a compile error, not a silent choice.
-aws-lc-crypto = ["lzma-fast/aws-lc"]
-native-crypto = ["lzma-fast/crypto"]
+# neither is a compile error, not a silent choice. AES-256-CBC itself is not
+# part of this choice: it is RustCrypto's `aes`/`cbc` on both lanes.
+aws-lc-crypto = ["lzma-fast/crypto"]
+native-crypto = ["lzma-fast/native-crypto"]
 brotli = ["dep:brotli"]
 bzip2 = ["dep:bzip2"]
-# `aes`/`cbc` are here rather than under `aes256` because only the *encoder*
-# needs them: `lzma-fast` exposes the decrypting half of AES-256-CBC, which is
-# all a reader uses. See `docs/lzma-fast-requests.md`.
 compress = ["dep:lzma-rust2", "dep:aes", "dep:cbc"]
 deflate = ["dep:flate2"]
 lz4 = ["dep:lz4_flex"]
@@ -57,7 +55,7 @@ getrandom = { version = "0.4", optional = true }
 # TEMPORARY: a path dependency while lzma-fast is unpublished. It becomes a
 # crates.io version pin before this crate is published — weaver's workspace
 # forbids `[patch.crates-io]`, so both crates are consumed published.
-lzma-fast = { path = "../lzma-fast/.worktrees/st-stable/crates/lzma-fast", default-features = false, features = ["std", "asm", "crc"] }
+lzma-fast = { path = "../lzma-fast/crates/lzma-fast", default-features = false, features = ["std", "asm", "crc"] }
 # Encoders only, behind `compress`. The decode path never reaches lzma-rust2;
 # see AGENTS.md.
 lzma-rust2 = { version = "0.20", default-features = false, features = ["std", "encoder", "optimization"], optional = true }

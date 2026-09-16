@@ -10,14 +10,14 @@ use aes::{
 };
 
 use crate::Password;
-use crate::crypto_backend::{AES_BLOCK_LEN, Aes256Cbc, Sha256, Sha256Like};
+use crate::crypto_backend::{AES_BLOCK_LEN, Aes256Cbc, AesError, Sha256, Sha256Like};
 #[cfg(feature = "compress")]
 use crate::encoder_options::AesEncoderOptions;
 
 #[cfg(feature = "compress")]
 type Aes256CbcEnc = cbc::Encryptor<Aes256>;
 
-fn crypto_error(err: lzma_fast::crypto::CryptoError) -> std::io::Error {
+fn crypto_error(err: AesError) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, err)
 }
 
