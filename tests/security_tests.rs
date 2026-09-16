@@ -4,7 +4,7 @@
 
 use std::io::Cursor;
 
-use sevenz_rust2::{ArchiveEntry, ArchiveReader, ArchiveWriter, Password, decompress};
+use sevenz_fast::{ArchiveEntry, ArchiveReader, ArchiveWriter, Password, decompress};
 use tempfile::tempdir;
 
 /// Builds a valid single-file archive whose only entry has the given (attacker-chosen) name.
@@ -329,7 +329,7 @@ fn more_substreams_than_files_is_rejected() {
 /// The payload is longer than 256 bytes so the distance genuinely affects the transform.
 #[test]
 fn delta_distance_256_round_trips() {
-    use sevenz_rust2::encoder_options::DeltaOptions;
+    use sevenz_fast::encoder_options::DeltaOptions;
 
     let original: Vec<u8> = (0..1024u32).map(|i| i.wrapping_mul(31) as u8).collect();
 
@@ -607,7 +607,7 @@ impl<R: std::io::Seek> std::io::Seek for DripReader<R> {
 #[cfg(feature = "aes256")]
 #[test]
 fn aes_decode_survives_one_byte_reads() {
-    use sevenz_rust2::encoder_options::AesEncoderOptions;
+    use sevenz_fast::encoder_options::AesEncoderOptions;
 
     let original: Vec<u8> = (0..200u32).map(|i| i as u8).collect();
 

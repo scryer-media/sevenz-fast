@@ -182,7 +182,7 @@ impl Archive {
     ///     io::{Read, Seek},
     /// };
     ///
-    /// use sevenz_rust2::*;
+    /// use sevenz_fast::*;
     ///
     /// let mut reader = File::open("example.7z").unwrap();
     ///

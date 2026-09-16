@@ -1,0 +1,34 @@
+name: Bug report
+description: An archive failed to extract, extracted wrong bytes, panicked or hung.
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: sevenz-fast version
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: Include the error or panic message, and how the archive was produced (7-Zip version, method flags).
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: A small archive attached, or the `7zz a` command that builds one. Never attach private data.
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform (OS, CPU, rustc version)
+  - type: checkboxes
+    id: upstream
+    attributes:
+      label: Upstream check
+      options:
+        - label: I checked whether sevenz-rust2 (the upstream crate this forks) has the same behaviour.

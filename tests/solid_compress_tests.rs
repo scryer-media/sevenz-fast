@@ -1,5 +1,5 @@
 #[cfg(feature = "compress")]
-use sevenz_rust2::*;
+use sevenz_fast::*;
 #[cfg(all(feature = "compress", feature = "util"))]
 use tempfile::*;
 

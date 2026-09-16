@@ -3,7 +3,7 @@
 fn test_decompress_file_with_password() {
     use std::{fs::read_to_string, path::PathBuf};
 
-    use sevenz_rust2::decompress_file_with_password;
+    use sevenz_fast::decompress_file_with_password;
     use tempfile::tempdir;
 
     let mut source_file = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -26,7 +26,7 @@ fn test_decompress_file_with_password() {
 fn test_decompress_file_with_password_small() {
     use std::path::PathBuf;
 
-    use sevenz_rust2::ArchiveReader;
+    use sevenz_fast::ArchiveReader;
 
     let mut source_file = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     source_file.push("tests/resources/aes_small_test.7z");

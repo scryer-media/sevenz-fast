@@ -1,7 +1,17 @@
 //! This project is a 7z compressor/decompressor written in pure Rust.
 //!
-//! This is a fork of the original, unmaintained sevenz-rust crate to continue the development
-//! and maintenance.
+//! `sevenz-fast` is a fork of [sevenz-rust2](https://github.com/hasenbanck/sevenz-rust2)
+//! (itself a fork of the unmaintained `sevenz-rust`). It differs from upstream
+//! in two ways, and the module paths and public API are otherwise upstream's:
+//!
+//! 1. LZMA and LZMA2 decode through [`lzma-fast`](https://github.com/scryer-media/lzma-fast),
+//!    a port of the 7-Zip reference decoder, instead of `lzma-rust2`.
+//! 2. It adds the container API a streaming consumer needs: memory limits
+//!    enforced before allocation, per-member CRCs, folder-to-pack-stream byte
+//!    ranges, a borrowing reader, typed corruption errors carrying a block
+//!    index and packed offset, and a per-block completion hook.
+//!
+//! The `CHANGELOG.md` section "Fork" is the exhaustive divergence list.
 //!
 //! ## Supported Codecs & filters
 //!

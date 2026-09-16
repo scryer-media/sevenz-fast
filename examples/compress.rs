@@ -1,6 +1,6 @@
 use std::{env, fs::File, time::Instant};
 
-use sevenz_rust2::{ArchiveReader, ArchiveWriter, Password};
+use sevenz_fast::{ArchiveReader, ArchiveWriter, Password};
 
 fn main() {
     let args: Vec<String> = env::args().collect();

@@ -5,7 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## 0.23.0 - Unreleased
+## Fork
+
+`sevenz-fast` is a fork of [sevenz-rust2](https://github.com/hasenbanck/sevenz-rust2)
+taken at upstream `12ed7c8` (post-v0.22.2). This section is the exhaustive list
+of how it differs from that commit, and it is the checklist a rebase is checked
+against. Upstream's own changelog continues below, unchanged.
+
+### Packaging
+
+- Crate renamed to `sevenz-fast`; the Rust module paths and the public API stay
+  upstream's, so a consumer's migration is `sevenz_rust2::` → `sevenz_fast::`.
+- Version starts at `0.23.0`, one minor above the upstream base, to make the
+  lineage obvious. The upstream `0.23.0 - Unreleased` entries below are part of
+  the fork base and ship with it.
+- MSRV raised from 1.93 to 1.97.1, which `lzma-fast` requires. Pinned in
+  `rust-toolchain.toml`.
+- `Cargo.lock` is committed (upstream ignores it) so CI can run `--locked` and
+  `cargo audit` has something to audit.
+- Repository hygiene adopted from the scryer-media house style: SHA-pinned CI
+  (`fmt`, `clippy -D warnings`, four-platform tests, MSRV, docs, package),
+  `security` (cargo-audit, zizmor), `codeql` + scorecard, gitleaks pre-commit
+  hooks, renovate, issue templates, `AGENTS.md`, `SECURITY.md`,
+  `CONTRIBUTORS.md`. Upstream's `.github/workflows/rust.yml` and
+  `.github/dependabot.yml` were removed as duplicates of these.
+- The `lzma-fast` dependency is a path dependency for now. It becomes a
+  crates.io version pin before this crate is published.
+
+## 0.23.0 - Unreleased (upstream, inherited at the fork point)
 
 ### Added
 

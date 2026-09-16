@@ -1,0 +1,21 @@
+name: Feature request
+description: Something the 7z reader or writer should do that it does not.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: What you need and why
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope check
+      description: >
+        This is a fork of sevenz-rust2 that exists to decode LZMA/LZMA2 with
+        lzma-fast and to expose the container detail a streaming consumer needs.
+        A request that is not about either is usually better filed upstream at
+        https://github.com/hasenbanck/sevenz-rust2 — say why it belongs here.
+    validations:
+      required: true

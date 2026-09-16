@@ -1,6 +1,40 @@
 /target
-/Cargo.lock
+/target-*/
 /data
 .DS_Store
+**/.DS_Store
+._*
 .idea
 .junie
+
+# Generated benchmark and differential fixtures. Only the small archives under
+# tests/resources and examples/data are tracked; everything else that 7zz or a
+# test writes is scratch. The CI `hygiene` lane enforces this.
+/bench/
+/fixtures/
+*.7z.tmp
+
+# Local CI/release artifacts
+/.ci-*.txt
+/dist/
+/package/
+/logs/
+/SHA256SUMS
+
+# Rust profiling/coverage
+/coverage/
+*.profraw
+*.profdata
+/perf.data*
+/*.trace/
+
+# Local environment/secrets
+.env
+.env.*
+!.env.example
+
+# Cargo-fuzz build state and generated crash artifacts.
+**/fuzz/target/
+**/fuzz/artifacts/
+**/fuzz/coverage/
+**/fuzz/Cargo.lock

@@ -150,7 +150,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
     /// ```no_run
     /// use std::{fs::File, path::Path};
     ///
-    /// use sevenz_rust2::*;
+    /// use sevenz_fast::*;
     /// let mut sz = ArchiveWriter::create("path/to/dest.7z").expect("create writer ok");
     /// let src = Path::new("path/to/source.txt");
     /// let name = "source.txt".to_string();

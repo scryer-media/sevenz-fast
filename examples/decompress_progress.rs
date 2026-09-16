@@ -28,7 +28,7 @@ fn safe_join(dest: &Path, entry_name: &str) -> std::io::Result<PathBuf> {
 
 fn main() {
     let mut sz =
-        sevenz_rust2::ArchiveReader::open("examples/data/sample.7z", "pass".into()).unwrap();
+        sevenz_fast::ArchiveReader::open("examples/data/sample.7z", "pass".into()).unwrap();
     let total_size: u64 = sz
         .archive()
         .files

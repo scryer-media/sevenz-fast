@@ -6,8 +6,8 @@ use std::{
 };
 
 #[cfg(feature = "util")]
-use sevenz_rust2::decompress_file;
-use sevenz_rust2::{Archive, ArchiveReader, BlockDecoder, Password};
+use sevenz_fast::decompress_file;
+use sevenz_fast::{Archive, ArchiveReader, BlockDecoder, Password};
 #[cfg(feature = "util")]
 use tempfile::tempdir;
 
@@ -343,7 +343,7 @@ fn test_get_file_by_path() {
 fn anti_item_deletes_file_on_extract() {
     use std::io::Cursor;
 
-    use sevenz_rust2::{
+    use sevenz_fast::{
         ArchiveEntry, ArchiveWriter, decompress_with_extract_fn, default_entry_extract_fn,
     };
 
@@ -382,7 +382,7 @@ fn anti_item_deletes_file_on_extract() {
 fn build_archive_with_entry_name(name: &str) -> Vec<u8> {
     use std::io::Cursor;
 
-    use sevenz_rust2::{ArchiveEntry, ArchiveWriter};
+    use sevenz_fast::{ArchiveEntry, ArchiveWriter};
 
     let mut bytes = Vec::new();
     {
@@ -400,7 +400,7 @@ fn build_archive_with_entry_name(name: &str) -> Vec<u8> {
 fn path_traversal_relative_entry_is_rejected() {
     use std::io::Cursor;
 
-    use sevenz_rust2::decompress;
+    use sevenz_fast::decompress;
 
     let temp_dir = tempdir().unwrap();
     let dest = temp_dir.path().join("out");
@@ -425,7 +425,7 @@ fn path_traversal_relative_entry_is_rejected() {
 fn path_traversal_absolute_entry_is_rejected() {
     use std::io::Cursor;
 
-    use sevenz_rust2::decompress;
+    use sevenz_fast::decompress;
 
     let temp_dir = tempdir().unwrap();
     let dest = temp_dir.path().join("out");
@@ -450,7 +450,7 @@ fn path_traversal_absolute_entry_is_rejected() {
 fn path_traversal_normal_nested_entry_still_extracts() {
     use std::io::Cursor;
 
-    use sevenz_rust2::decompress;
+    use sevenz_fast::decompress;
 
     let temp_dir = tempdir().unwrap();
     let dest = temp_dir.path().join("out");
@@ -465,7 +465,7 @@ fn path_traversal_normal_nested_entry_still_extracts() {
 #[cfg(all(feature = "compress", feature = "util"))]
 #[test]
 fn default_entry_extract_fn_rejects_parent_dir_component() {
-    use sevenz_rust2::{ArchiveEntry, default_entry_extract_fn};
+    use sevenz_fast::{ArchiveEntry, default_entry_extract_fn};
 
     // Defense-in-depth: a caller that bypasses `decompress_impl` and hands an
     // already-joined path containing `..` directly to the default extractor must
@@ -487,7 +487,7 @@ fn default_entry_extract_fn_rejects_parent_dir_component() {
     assert!(!escaped.exists(), "no file may be written via a `..` path");
 }
 
-/// Regression test for <https://github.com/hasenbanck/sevenz-rust2/issues/127>.
+/// Regression test for <https://github.com/hasenbanck/sevenz-fast/issues/127>.
 #[test]
 fn malformed_coder_stream_counts_are_rejected() {
     let mut file = File::open("tests/resources/issue_127_coder_stream_overflow.bin").unwrap();

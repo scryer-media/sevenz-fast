@@ -1,6 +1,6 @@
 use std::path::{Component, Path, PathBuf};
 
-use sevenz_rust2::{Archive, BlockDecoder, Password};
+use sevenz_fast::{Archive, BlockDecoder, Password};
 
 /// Joins an untrusted archive entry name onto `dest`, rejecting any path that would escape
 /// the destination directory (Zip-Slip / CWE-22). Always route `entry.name()` through a
@@ -48,7 +48,7 @@ fn main() {
                 if entry.name() == my_file_name {
                     //only extract the file we want
                     let dest = safe_join(&dest, entry.name())?;
-                    sevenz_rust2::default_entry_extract_fn(entry, reader, &dest)?;
+                    sevenz_fast::default_entry_extract_fn(entry, reader, &dest)?;
                 } else {
                     //skip other files
                     std::io::copy(reader, &mut std::io::sink())?;
