@@ -16,7 +16,7 @@ use std::{
 use std::{fs::File, path::Path};
 
 pub(crate) use counting_writer::CountingWriter;
-use crc32fast::Hasher;
+use lzma_fast::crc::{Crc32, crc32 as crc32_of};
 
 #[cfg(all(feature = "util", not(target_arch = "wasm32")))]
 pub(crate) use self::lazy_file_reader::LazyFileReader;
@@ -393,7 +393,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         self.write_encoded_header(&mut header)?;
         let header_pos = self.output.stream_position()?;
         self.output.write_all(&header)?;
-        let crc32 = crc32fast::hash(&header);
+        let crc32 = crc32_of(&header);
         let mut hh = [0u8; SIGNATURE_HEADER_SIZE as usize];
         {
             let mut hhw = hh.as_mut_slice();
@@ -410,7 +410,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             hhw.write_u64(0xFFFFFFFF & header.len() as u64)?;
             hhw.write_u32(crc32)?;
         }
-        let crc32 = crc32fast::hash(&hh[12..]);
+        let crc32 = crc32_of(&hh[12..]);
         hh[8..12].copy_from_slice(&crc32.to_le_bytes());
 
         self.output.seek(std::io::SeekFrom::Start(0))?;
@@ -439,7 +439,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
 
         let mut more_sizes = vec![];
         let size = raw_header.len() as u64;
-        let crc32 = crc32fast::hash(&raw_header);
+        let crc32 = crc32_of(&raw_header);
         let mut methods = vec![];
 
         let mut must_encrypt_header = false;
@@ -669,7 +669,7 @@ pub(crate) fn write_u64<W: Write>(header: &mut W, mut value: u64) -> std::io::Re
 
 struct CompressWrapWriter<'a, W> {
     writer: W,
-    crc: Hasher,
+    crc: Crc32,
     cache: Vec<u8>,
     bytes_written: &'a mut usize,
 }
@@ -678,14 +678,14 @@ impl<'a, W: Write> CompressWrapWriter<'a, W> {
     pub fn new(writer: W, bytes_written: &'a mut usize) -> Self {
         Self {
             writer,
-            crc: Hasher::new(),
+            crc: Crc32::new(),
             cache: Vec::with_capacity(8192),
             bytes_written,
         }
     }
 
     pub fn crc_value(&mut self) -> u32 {
-        let crc = std::mem::replace(&mut self.crc, Hasher::new());
+        let crc = std::mem::replace(&mut self.crc, Crc32::new());
         crc.finalize()
     }
 }

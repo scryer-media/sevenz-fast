@@ -32,6 +32,70 @@ against. Upstream's own changelog continues below, unchanged.
 - The `lzma-fast` dependency is a path dependency for now. It becomes a
   crates.io version pin before this crate is published.
 
+### Decoding
+
+- LZMA (`0x030101`) and LZMA2 (`0x21`) are decoded by
+  [`lzma-fast`](https://github.com/scryer-media/lzma-fast) instead of
+  `lzma-rust2`. On the fixtures in `docs/benchmarking.md` this is 1.61x
+  upstream's throughput and level with `7zz t -mmt=1`, where upstream was 1.3x
+  behind it.
+- `lzma-rust2` has left the library's runtime dependency graph. It remains an
+  optional dependency behind the `compress` feature, which still uses its LZMA
+  and LZMA2 *encoders*; with `--no-default-features` the graph is
+  `sevenz-fast → lzma-fast → crc-fast` and nothing else.
+- The BCJ, BCJ2 and delta filters are vendored into `src/codec/filter/` from
+  `lzma-rust2` 0.20.1 (Apache-2.0, same licence), which is what lets
+  `lzma-rust2` leave the decode graph rather than be carried for three filters.
+  `src/codec/filter/mod.rs` documents the provenance and the mechanical
+  changes.
+- `Decoder::Lzma2Mt` was removed. `lzma-fast` has no multi-threaded reader yet,
+  so the variant would have been a decoder that silently was not there; the
+  thread count now selects an `Lzma2Plan`, which is the single adapter point a
+  future parallel reader plugs into (`src/codec/lzma_fast.rs`).
+- LZMA1 is now subject to the same dictionary memory limit as LZMA2. Upstream
+  bounded only LZMA2, so an archive declaring a 4 GiB LZMA1 dictionary would
+  try to allocate it.
+- CRC-32 comes from `crc-fast` (via `lzma-fast`) rather than `crc32fast`; the
+  `crc32fast` dependency is gone.
+- The LZMA coder's properties are length-checked before being sliced, instead
+  of panicking on a short field.
+
+### Cryptography
+
+- AES-256-CBC and SHA-256 for the `aes256` coder now come from `lzma-fast`'s
+  crypto module behind one internal backend module, `src/crypto_backend.rs`.
+  The default backend is `aws-lc-rs` (feature `aws-lc-crypto`, in `default`),
+  the scryer-media house convention shared with `lzma-fast` and `rarpar`;
+  `native-crypto` selects RustCrypto (`sha2`, `aes`, `cbc`) and **takes
+  precedence** when both are compiled, so a consumer who cannot build C uses
+  `default-features = false` plus `native-crypto`.
+- `aes256` no longer implies a backend: enabling it with neither
+  `aws-lc-crypto` nor `native-crypto` is a compile error. A consumer migrating
+  from upstream with `default-features = false, features = ["aes256", …]` adds
+  `"aws-lc-crypto"` to that list.
+- New `sevenz_fast::crypto_backend() -> &'static str`, reporting which backend
+  a build selected, for consumers who want to assert on it.
+- The `aes` and `cbc` dependencies moved from `aes256` to `compress`: only the
+  *encoder* needs them, because `lzma-fast` exposes the decrypting half of
+  AES-256-CBC, which is all a reader uses. The direct `sha2` dependency is
+  gone.
+- When both backends are compiled, a differential test checks they agree on
+  AES-256-CBC, on SHA-256 and on the 7z key derivation; both are checked
+  against NIST SP 800-38A F.2.6 and the SHA-256 vectors independently of each
+  other. `7zAes.c`'s two special cycle counts (`0x3F`, `>= 0x40`) have tests of
+  their own.
+
+### Testing
+
+- `tests/differential_7zz_tests.rs`: archives built with `7zz a` across the
+  method matrix are extracted with both `7zz x` and this crate and compared
+  byte for byte. Skips itself when `7zz` is not on `PATH`.
+- `tools/decode-bench`: times `7zz`, upstream `sevenz-rust2` 0.22.2 and this
+  fork on the same archive in one session. Results in `docs/benchmarking.md`.
+- The vendored BCJ round-trip tests generate their sample data instead of
+  reading the binary fixtures `lzma-rust2` keeps in its repository, which are
+  not ours to vendor.
+
 ## 0.23.0 - Unreleased (upstream, inherited at the fork point)
 
 ### Added

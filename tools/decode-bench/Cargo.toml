@@ -1,0 +1,14 @@
+[package]
+name = "decode-bench"
+description = "Times 7z LZMA2 extraction through 7-Zip, upstream sevenz-rust2 and this fork"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+rust-version = "1.97.1"
+version = "0.0.0"
+
+[dependencies]
+# The fork under test.
+sevenz-fast = { path = "../..", default-features = false, features = ["aes256", "brotli", "bzip2", "deflate", "lz4", "ppmd", "util", "zstd"] }
+# The baseline the fork has to beat: the exact release weaver ships today.
+sevenz-rust2 = { version = "=0.22.2", default-features = false, features = ["aes256", "brotli", "bzip2", "deflate", "lz4", "ppmd", "util", "zstd"] }

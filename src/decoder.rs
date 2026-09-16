@@ -1,14 +1,10 @@
-use std::{io, io::Read};
+use std::io::Read;
 
 #[cfg(feature = "bzip2")]
 use bzip2::read::BzDecoder;
 #[cfg(feature = "deflate")]
 use flate2::bufread::DeflateDecoder;
-use lzma_rust2::{
-    Lzma2Reader, Lzma2ReaderMt, LzmaReader,
-    filter::{bcj::BcjReader, delta::DeltaReader},
-    lzma2_get_memory_usage,
-};
+use lzma_fast::{Lzma2Reader, LzmaReader};
 #[cfg(feature = "ppmd")]
 use ppmd_rust::{
     PPMD7_MAX_MEM_SIZE, PPMD7_MAX_ORDER, PPMD7_MIN_MEM_SIZE, PPMD7_MIN_ORDER, Ppmd7Decoder,
@@ -18,15 +14,18 @@ use ppmd_rust::{
 use crate::codec::brotli::BrotliDecoder;
 #[cfg(feature = "lz4")]
 use crate::codec::lz4::Lz4Decoder;
+use crate::codec::{
+    filter::{bcj::BcjReader, delta::DeltaReader},
+    lzma_fast::{Lzma2Plan, lzma2_decoder, lzma2_dictionary_size, lzma2_memory_usage_kb},
+};
 #[cfg(feature = "aes256")]
 use crate::encryption::Aes256Sha256Decoder;
-use crate::{ByteReader, Password, archive::EncoderMethod, block::Coder, error::Error};
+use crate::{Password, archive::EncoderMethod, block::Coder, error::Error};
 
 pub enum Decoder<R: Read> {
     Copy(R),
     Lzma(Box<LzmaReader<R>>),
     Lzma2(Box<Lzma2Reader<R>>),
-    Lzma2Mt(Box<Lzma2ReaderMt<R>>),
     #[cfg(feature = "ppmd")]
     Ppmd(Box<Ppmd7Decoder<R>>),
     Bcj(BcjReader<R>),
@@ -51,7 +50,6 @@ impl<R: Read> Read for Decoder<R> {
             Decoder::Copy(r) => r.read(buf),
             Decoder::Lzma(r) => r.read(buf),
             Decoder::Lzma2(r) => r.read(buf),
-            Decoder::Lzma2Mt(r) => r.read(buf),
             #[cfg(feature = "ppmd")]
             Decoder::Ppmd(r) => r.read(buf),
             Decoder::Bcj(r) => r.read(buf),
@@ -92,21 +90,27 @@ pub fn add_decoder<I: Read>(
     match method.id() {
         EncoderMethod::ID_COPY => Ok(Decoder::Copy(input)),
         EncoderMethod::ID_LZMA => {
-            // Validate the length before touching the properties: `get_lzma_dic_size`
+            // Validate the length before touching the properties: the decoder
             // slices `[1..5]`, which would panic on an attacker-supplied short field.
             if coder.properties.len() < 5 {
                 return Err(Error::Other("LZMA properties too short".into()));
             }
-            let dict_size = get_lzma_dic_size(coder)?;
-            let props = coder.properties[0];
+            let dict_size = crate::codec::lzma_fast::lzma_dictionary_size(&coder.properties)?;
+            let mem_size = lzma2_memory_usage_kb(dict_size);
+            if mem_size > max_mem_limit_kb {
+                return Err(Error::MaxMemLimited {
+                    max_kb: max_mem_limit_kb,
+                    actaul_kb: mem_size,
+                });
+            }
             let lz =
-                LzmaReader::new_with_props(input, uncompressed_len as _, props, dict_size, None)
+                crate::codec::lzma_fast::lzma_decoder(input, uncompressed_len, &coder.properties)
                     .map_err(|e| Error::bad_password(e, !password.is_empty()))?;
             Ok(Decoder::Lzma(Box::new(lz)))
         }
         EncoderMethod::ID_LZMA2 => {
-            let dic_size = get_lzma2_dic_size(coder)?;
-            let mem_size = lzma2_get_memory_usage(dic_size) as usize;
+            let dic_size = lzma2_dictionary_size(&coder.properties)?;
+            let mem_size = lzma2_memory_usage_kb(dic_size);
             if mem_size > max_mem_limit_kb {
                 return Err(Error::MaxMemLimited {
                     max_kb: max_mem_limit_kb,
@@ -114,13 +118,10 @@ pub fn add_decoder<I: Read>(
                 });
             }
 
-            let lz = if threads < 2 {
-                Decoder::Lzma2(Box::new(Lzma2Reader::new(input, dic_size, None)))
-            } else {
-                Decoder::Lzma2Mt(Box::new(Lzma2ReaderMt::new(input, dic_size, None, threads)))
-            };
-
-            Ok(lz)
+            let plan = Lzma2Plan::for_thread_count(threads);
+            let lz = lzma2_decoder(input, &coder.properties, plan)
+                .map_err(|e| Error::bad_password(e, !password.is_empty()))?;
+            Ok(Decoder::Lzma2(Box::new(lz)))
         }
         #[cfg(feature = "ppmd")]
         EncoderMethod::ID_PPMD => {
@@ -251,27 +252,4 @@ fn get_ppmd_order_memory_size(coder: &Coder, max_mem_limit_kb: usize) -> Result<
     }
 
     Ok((order, memory_size))
-}
-
-fn get_lzma2_dic_size(coder: &Coder) -> Result<u32, Error> {
-    if coder.properties.is_empty() {
-        return Err(Error::other("LZMA2 properties too short"));
-    }
-    let dict_size_bits = 0xFF & coder.properties[0] as u32;
-    if (dict_size_bits & (!0x3F)) != 0 {
-        return Err(Error::other("Unsupported LZMA2 property bits"));
-    }
-    if dict_size_bits > 40 {
-        return Err(Error::other("Dictionary larger than 4GiB maximum size"));
-    }
-    if dict_size_bits == 40 {
-        return Ok(0xFFFFFFFF);
-    }
-    let size = (2 | (dict_size_bits & 0x1)) << (dict_size_bits / 2 + 11);
-    Ok(size)
-}
-
-fn get_lzma_dic_size(coder: &Coder) -> io::Result<u32> {
-    let mut props = &coder.properties[1..5];
-    props.read_u32()
 }

@@ -8,11 +8,11 @@ use std::{
     rc::Rc,
 };
 
-use crc32fast::Hasher;
-use lzma_rust2::filter::bcj2::Bcj2Reader;
+use lzma_fast::crc::{Crc32, crc32};
 
 use crate::{
-    ByteReader, Password, archive::*, bitset::BitSet, block::*, decoder::add_decoder, error::Error,
+    ByteReader, Password, archive::*, bitset::BitSet, block::*, codec::filter::bcj2::Bcj2Reader,
+    decoder::add_decoder, error::Error,
 };
 
 const MAX_MEM_LIMIT_KB: usize = usize::MAX / 1024;
@@ -111,7 +111,7 @@ impl<'a, R: Read + Seek> SharedBoundedReader<'a, R> {
 
 struct Crc32VerifyingReader<R> {
     inner: R,
-    crc_digest: Hasher,
+    crc_digest: Crc32,
     expected_value: u64,
     remaining: i64,
 }
@@ -120,7 +120,7 @@ impl<R: Read> Crc32VerifyingReader<R> {
     fn new(inner: R, remaining: usize, expected_value: u64) -> Self {
         Self {
             inner,
-            crc_digest: Hasher::new(),
+            crc_digest: Crc32::new(),
             expected_value,
             remaining: remaining as i64,
         }
@@ -138,7 +138,7 @@ impl<R: Read> Read for Crc32VerifyingReader<R> {
             self.crc_digest.update(&buf[..size]);
         }
         if self.remaining <= 0 {
-            let d = std::mem::replace(&mut self.crc_digest, Hasher::new()).finalize();
+            let d = std::mem::replace(&mut self.crc_digest, Crc32::new()).finalize();
             if d as u64 != self.expected_value {
                 return Err(std::io::Error::other(Error::ChecksumVerificationFailed));
             }
@@ -238,7 +238,7 @@ impl Archive {
     ) -> Result<StartHeader, Error> {
         let mut buf = [0; 20];
         reader.read_exact(&mut buf)?;
-        let crc32 = crc32fast::hash(&buf);
+        let crc32 = crc32(&buf);
         if crc32 != start_header_crc {
             return Err(Error::ChecksumVerificationFailed);
         }
@@ -370,7 +370,7 @@ impl Archive {
 
         let mut buf = vec![0; next_header_size_int];
         reader.read_exact(&mut buf)?;
-        if verify_crc && crc32fast::hash(&buf) as u64 != start_header.next_header_crc {
+        if verify_crc && u64::from(crc32(&buf)) != start_header.next_header_crc {
             return Err(Error::NextHeaderCrcMismatch);
         }
 

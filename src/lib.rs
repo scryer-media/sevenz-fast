@@ -47,12 +47,27 @@
 #[cfg(target_arch = "wasm32")]
 extern crate wasm_bindgen;
 
+#[cfg(feature = "aes256")]
+mod crypto_backend;
 #[cfg(feature = "compress")]
 mod encoder;
 /// Encoding options when compressing.
 #[cfg(feature = "compress")]
 pub mod encoder_options;
 mod encryption;
+
+/// Names the cryptography backend this build of the crate selected for the 7z
+/// `aes256` coder: `"aws-lc"` or `"rustcrypto"`.
+///
+/// Which cryptography ends up in a binary is decided by Cargo features that a
+/// dependency can turn on without the top-level crate noticing, so this is
+/// here to be asserted on in a consumer's own tests. See the `aws-lc-crypto`
+/// and `native-crypto` features.
+#[cfg(feature = "aes256")]
+#[must_use]
+pub fn crypto_backend() -> &'static str {
+    crypto_backend::BACKEND
+}
 mod error;
 mod reader;
 

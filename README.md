@@ -46,6 +46,13 @@ The 7z `aes256` coder needs AES-256-CBC and SHA-256. The default backend is
 `sha2`) and takes precedence, so a consumer that cannot build C can use
 `default-features = false` with `aes256, native-crypto`. CRC-32 is `crc-fast`.
 
+Because Cargo features are additive, `native-crypto` cannot mean "turn AWS-LC
+off"; it means "win when both are compiled". So `aes256` does not pull a
+backend in by itself: with `default-features = false` you pick one explicitly,
+and asking for `aes256` with neither is a compile error rather than a silent
+choice about what cryptography is in your binary. `sevenz_fast::crypto_backend()`
+reports which one a build selected.
+
 ## Usage
 
 ```toml

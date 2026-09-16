@@ -11,18 +11,36 @@ repository = "https://github.com/scryer-media/sevenz-fast"
 rust-version = "1.97.1"
 version = "0.23.0"
 
+# `tools/decode-bench` is a workspace member rather than an example because it
+# depends on upstream `sevenz-rust2` to time the fork against it, and that
+# dependency must not appear in this crate's own graph at all.
+[workspace]
+members = ["tools/decode-bench"]
+resolver = "3"
+
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [features]
-default = ["aes256", "bzip2", "compress", "ppmd", "util"]
-default_wasm = ["aes256_wasm", "bzip2", "compress", "ppmd", "util"]
+default = ["aes256", "aws-lc-crypto", "bzip2", "compress", "ppmd", "util"]
+# wasm has no C toolchain, so it takes the RustCrypto backend.
+default_wasm = ["aes256_wasm", "native-crypto", "bzip2", "compress", "ppmd", "util"]
 nt-time = ["dep:nt-time"]
-aes256 = ["dep:aes", "dep:cbc", "dep:getrandom", "dep:sha2"]
+aes256 = ["dep:getrandom"]
 aes256_wasm = ["aes256", "getrandom/wasm_js"]
+# Cryptography backends for `aes256`. See `src/crypto_backend.rs`: the features
+# are additive, so `native-crypto` does not turn `aws-lc-crypto` off — it takes
+# precedence over it. A build that wants no AWS-LC asks for
+# `default-features = false` plus `native-crypto`. Enabling `aes256` with
+# neither is a compile error, not a silent choice.
+aws-lc-crypto = ["lzma-fast/aws-lc"]
+native-crypto = ["lzma-fast/crypto"]
 brotli = ["dep:brotli"]
 bzip2 = ["dep:bzip2"]
-compress = ["lzma-rust2/encoder"]
+# `aes`/`cbc` are here rather than under `aes256` because only the *encoder*
+# needs them: `lzma-fast` exposes the decrypting half of AES-256-CBC, which is
+# all a reader uses. See `docs/lzma-fast-requests.md`.
+compress = ["dep:lzma-rust2", "dep:aes", "dep:cbc"]
 deflate = ["dep:flate2"]
 lz4 = ["dep:lz4_flex"]
 ppmd = ["dep:ppmd-rust"]
@@ -34,12 +52,16 @@ aes = { version = "0.9", optional = true }
 brotli = { version = ">= 7, < 10", default-features = false, optional = true, features = ["std"] }
 bzip2 = { version = "0.6", optional = true }
 cbc = { version = "0.2", optional = true }
-crc32fast = "1"
 flate2 = { version = "1", optional = true, features = ["zlib-rs"] }
 getrandom = { version = "0.4", optional = true }
-lzma-rust2 = { version = "0.20", default-features = false, features = ["std", "optimization"] }
+# TEMPORARY: a path dependency while lzma-fast is unpublished. It becomes a
+# crates.io version pin before this crate is published — weaver's workspace
+# forbids `[patch.crates-io]`, so both crates are consumed published.
+lzma-fast = { path = "../lzma-fast/.worktrees/st-stable/crates/lzma-fast", default-features = false, features = ["std", "asm", "crc"] }
+# Encoders only, behind `compress`. The decode path never reaches lzma-rust2;
+# see AGENTS.md.
+lzma-rust2 = { version = "0.20", default-features = false, features = ["std", "encoder", "optimization"], optional = true }
 ppmd-rust = { version = "1", optional = true }
-sha2 = { version = "0.11", optional = true }
 lz4_flex = { version = "0.14", optional = true }
 nt-time = { version = "0.15", optional = true }
 zstd = { version = "0.14", optional = true }
@@ -78,3 +100,7 @@ required-features = ["default"]
 
 [package.metadata.docs.rs]
 all-features = true
+
+[profile.release]
+lto = "fat"
+codegen-units = 1

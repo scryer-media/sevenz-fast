@@ -1,9 +1,8 @@
 use std::io::Write;
 
-use lzma_rust2::{
-    Lzma2Writer, Lzma2WriterMt, LzmaWriter,
-    filter::{bcj::BcjWriter, delta::DeltaWriter},
-};
+use lzma_rust2::{Lzma2Writer, Lzma2WriterMt, LzmaWriter};
+
+use crate::codec::filter::{bcj::BcjWriter, delta::DeltaWriter};
 
 #[cfg(feature = "brotli")]
 use crate::codec::brotli::BrotliEncoder;

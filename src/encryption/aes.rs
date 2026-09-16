@@ -4,21 +4,22 @@ use std::{
 };
 
 #[cfg(feature = "compress")]
-use aes::cipher::BlockModeEncrypt;
 use aes::{
     Aes256,
-    cipher::{BlockModeDecrypt, KeyIvInit, array::Array},
+    cipher::{BlockModeEncrypt, KeyIvInit, array::Array},
 };
-use sha2::Digest;
 
 use crate::Password;
+use crate::crypto_backend::{AES_BLOCK_LEN, Aes256Cbc, Sha256, Sha256Like};
 #[cfg(feature = "compress")]
 use crate::encoder_options::AesEncoderOptions;
 
-type Aes256CbcDec = cbc::Decryptor<Aes256>;
-
 #[cfg(feature = "compress")]
 type Aes256CbcEnc = cbc::Encryptor<Aes256>;
+
+fn crypto_error(err: lzma_fast::crypto::CryptoError) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, err)
+}
 
 pub(crate) struct Aes256Sha256Decoder<R> {
     cipher: Cipher,
@@ -188,12 +189,23 @@ fn get_aes_key(properties: &[u8], password: &[u8]) -> Result<([u8; 32], [u8; 16]
 const MAX_AES_CYCLES_POWER: u8 = 24;
 
 fn derive_key(num_cycles_power: u8, salt: &[u8], password: &[u8]) -> [u8; 32] {
-    let mut sha = sha2::Sha256::default();
+    derive_key_with::<Sha256>(num_cycles_power, salt, password)
+}
+
+/// `7zAes.c`'s derivation, over whichever SHA-256 the caller names. Generic so
+/// that a build with both cryptography backends can check they agree; the
+/// crate itself only ever instantiates it at [`Sha256`].
+pub(crate) fn derive_key_with<S: Sha256Like>(
+    num_cycles_power: u8,
+    salt: &[u8],
+    password: &[u8],
+) -> [u8; 32] {
+    let mut sha = S::new();
     let mut extra = [0u8; 8];
     for _ in 0..(1u64 << num_cycles_power) {
         sha.update(salt);
         sha.update(password);
-        sha.update(extra);
+        sha.update(&extra);
         for item in &mut extra {
             *item = item.wrapping_add(1);
             if *item != 0 {
@@ -201,7 +213,7 @@ fn derive_key(num_cycles_power: u8, salt: &[u8], password: &[u8]) -> [u8; 32] {
             }
         }
     }
-    sha.finalize().into()
+    sha.finalize()
 }
 
 /// Cache last derived key.
@@ -209,11 +221,11 @@ fn derive_key_cached(num_cycles_power: u8, salt: &[u8], password: &[u8]) -> [u8;
     static KEY_CACHE: std::sync::Mutex<Option<([u8; 32], [u8; 32])>> = std::sync::Mutex::new(None);
 
     let fingerprint: [u8; 32] = {
-        let mut sha = sha2::Sha256::default();
-        sha.update([num_cycles_power, salt.len() as u8]);
+        let mut sha = Sha256::new();
+        sha.update(&[num_cycles_power, salt.len() as u8]);
         sha.update(salt);
         sha.update(password);
-        sha.finalize().into()
+        sha.finalize()
     };
     if let Some(key) = KEY_CACHE
         .lock()
@@ -230,7 +242,7 @@ fn derive_key_cached(num_cycles_power: u8, salt: &[u8], password: &[u8]) -> [u8;
 }
 
 struct Cipher {
-    dec: Aes256CbcDec,
+    dec: Aes256Cbc,
     buf: Vec<u8>,
 }
 
@@ -238,7 +250,8 @@ impl Cipher {
     fn from_properties(properties: &[u8], password: &[u8]) -> Result<Self, crate::Error> {
         let (aes_key, iv) = get_aes_key(properties, password)?;
         Ok(Self {
-            dec: Aes256CbcDec::new(&Array::from(aes_key), &iv.into()),
+            dec: Aes256Cbc::new(&aes_key, &iv)
+                .map_err(|err| crate::Error::other(err.to_string()))?,
             buf: Default::default(),
         })
     }
@@ -246,8 +259,8 @@ impl Cipher {
     fn update<W: Write>(&mut self, mut data: &mut [u8], mut output: W) -> std::io::Result<usize> {
         let mut n = 0;
         if !self.buf.is_empty() {
-            assert!(self.buf.len() < 16);
-            let end = 16 - self.buf.len();
+            assert!(self.buf.len() < AES_BLOCK_LEN);
+            let end = AES_BLOCK_LEN - self.buf.len();
             if data.len() < end {
                 // A short read (e.g. AES layered on top of another coder, whose reader can
                 // return fewer than 16 bytes) delivered less than what is needed to complete
@@ -258,20 +271,18 @@ impl Cipher {
             }
             self.buf.extend_from_slice(&data[..end]);
             data = &mut data[end..];
-            let block: &mut Array<u8, _> = self.buf.as_mut_slice().try_into().unwrap();
-            self.dec.decrypt_block(block);
-            let out = block.as_slice();
-            output.write_all(out)?;
-            n += out.len();
+            self.dec.decrypt(&mut self.buf).map_err(crypto_error)?;
+            output.write_all(&self.buf)?;
+            n += self.buf.len();
             self.buf.clear();
         }
 
-        let (blocks, remainder) = Array::<u8, _>::slice_as_chunks_mut(data);
+        let whole = data.len() - data.len() % AES_BLOCK_LEN;
+        let (blocks, remainder) = data.split_at_mut(whole);
         if !blocks.is_empty() {
-            self.dec.decrypt_blocks(blocks);
-            let out = Array::slice_as_flattened(blocks);
-            output.write_all(out)?;
-            n += out.len();
+            self.dec.decrypt(blocks).map_err(crypto_error)?;
+            output.write_all(blocks)?;
+            n += blocks.len();
         }
         self.buf.extend_from_slice(remainder);
         Ok(n)
@@ -411,6 +422,55 @@ mod key_derivation_tests {
         assert_eq!(derive_key_cached(CYCLES, a.0, a.1), ka);
         assert_eq!(derive_key_cached(CYCLES, c.0, c.1), kc);
         assert_eq!(derive_key_cached(CYCLES, b.0, b.1), kb);
+    }
+
+    /// Builds an AES coder property blob: `num_cycles_power` in the low six
+    /// bits of the first byte, the sizes split across the top two bits of the
+    /// first byte and the two nibbles of the second, then salt and IV.
+    fn properties(num_cycles_power: u8, salt: &[u8], iv: &[u8]) -> Vec<u8> {
+        assert!(salt.len() <= 16 && iv.len() <= 16);
+        // Each size is a top bit plus a nibble, so 16 is `1 + 15`.
+        let iv_high = u8::from(iv.len() == 16);
+        let salt_high = u8::from(salt.len() == 16);
+        let b0 = (num_cycles_power & 63) | (iv_high << 6) | (salt_high << 7);
+        let b1 = ((salt.len() as u8 - salt_high) << 4) | (iv.len() as u8 - iv_high);
+        let mut out = vec![b0, b1];
+        out.extend_from_slice(salt);
+        out.extend_from_slice(iv);
+        out
+    }
+
+    /// `7zAes.c` treats `0x3F` as "the key is the salt followed by the
+    /// password", with no hashing at all — so it is backend-independent by
+    /// construction, which is why the backend differential test skips it.
+    #[test]
+    fn raw_key_mode_concatenates_salt_and_password() {
+        let salt = b"0123456789abcdef";
+        let password = b"p\0a\0s\0s\0";
+        let (key, iv) = get_aes_key(&properties(0x3F, salt, &[0u8; 16]), password).expect("key");
+
+        let mut expected = [0u8; 32];
+        expected[..16].copy_from_slice(salt);
+        expected[16..16 + password.len()].copy_from_slice(password);
+        assert_eq!(key, expected);
+        assert_eq!(iv, [0u8; 16]);
+    }
+
+    /// A cycle count above the cap is a CPU-exhaustion attempt, not an
+    /// archive: `2^power` SHA-256 rounds, and above 31 the shift itself is
+    /// undefined. It has to be refused before any hashing starts.
+    #[test]
+    fn absurd_cycle_counts_are_refused() {
+        let salt = b"salt";
+        for power in [MAX_AES_CYCLES_POWER + 1, 40, 62] {
+            assert!(
+                get_aes_key(&properties(power, salt, &[0u8; 16]), b"pw").is_err(),
+                "cycle count {power} was accepted"
+            );
+        }
+        // The cap itself is 2^24 SHA-256 rounds, far too slow for a test; that
+        // an ordinary count is accepted is covered by the round-trip tests.
+        assert!(get_aes_key(&properties(4, salt, &[0u8; 16]), b"pw").is_ok());
     }
 
     #[test]

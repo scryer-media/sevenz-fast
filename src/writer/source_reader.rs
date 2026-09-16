@@ -1,6 +1,6 @@
 use std::io::Read;
 
-use crc32fast::Hasher;
+use lzma_fast::crc::Crc32;
 
 /// A wrapper around a reader that tracks read count and CRC32.
 ///
@@ -9,7 +9,7 @@ use crc32fast::Hasher;
 pub struct SourceReader<R> {
     reader: R,
     size: usize,
-    crc: Hasher,
+    crc: Crc32,
     crc_value: u32,
 }
 
@@ -27,7 +27,7 @@ impl<R: Read> Read for SourceReader<R> {
                 self.size += n;
                 self.crc.update(&buf[..n]);
             } else {
-                let crc = std::mem::replace(&mut self.crc, Hasher::new());
+                let crc = std::mem::replace(&mut self.crc, Crc32::new());
                 self.crc_value = crc.finalize();
             }
         }
@@ -44,7 +44,7 @@ impl<R> SourceReader<R> {
         Self {
             reader,
             size: 0,
-            crc: Hasher::new(),
+            crc: Crc32::new(),
             crc_value: 0,
         }
     }
