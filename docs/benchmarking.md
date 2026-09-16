@@ -53,17 +53,17 @@ archive.
 
 | Decoder | Median | MiB/s | vs upstream |
 | --- | --- | --- | --- |
-| `7zz t -mmt=1` | 14.976 s | 68.4 | 1.63x |
-| `sevenz-rust2` 0.22.2 | 24.436 s | 41.9 | 1.00x |
-| **`sevenz-fast`** | **15.211 s** | **67.3** | **1.61x** |
+| `7zz t -mmt=1` | 15.037 s | 68.1 | 1.63x |
+| `sevenz-rust2` 0.22.2 | 24.532 s | 41.7 | 1.00x |
+| **`sevenz-fast`** | **15.163 s** | **67.5** | **1.62x** |
 
 ### `mt.7z` (897.5 MiB packed, LZMA2 written with multi-threaded chunking)
 
 | Decoder | Median | MiB/s | vs upstream |
 | --- | --- | --- | --- |
-| `7zz t -mmt=1` | 15.040 s | 68.1 | 1.63x |
-| `sevenz-rust2` 0.22.2 | 24.529 s | 41.7 | 1.00x |
-| **`sevenz-fast`** | **15.200 s** | **67.4** | **1.61x** |
+| `7zz t -mmt=1` | 15.032 s | 68.1 | 1.63x |
+| `sevenz-rust2` 0.22.2 | 24.495 s | 41.8 | 1.00x |
+| **`sevenz-fast`** | **15.104 s** | **67.8** | **1.62x** |
 
 Both decoders produced the same digest (`34d3ed5d2f096858`) on both archives.
 
@@ -76,12 +76,12 @@ the same LZMA2 stream shape without a 7z container around it:
 | --- | --- |
 | `lzma-fast` (decode only) | 68.9 |
 | `lzma-fast` (incl. crc32) | 67.3 |
-| `sevenz-fast` on `st.7z` | 67.3 |
-| `sevenz-fast` on `mt.7z` | 67.4 |
+| `sevenz-fast` on `st.7z` | 67.5 |
+| `sevenz-fast` on `mt.7z` | 67.8 |
 
-So the 7z container path costs 2.3% against the bare decoder (and nothing at
+So the 7z container path costs 2.0% against the bare decoder (and nothing at
 all against the decoder with its CRC on, which is the honest comparison,
-because the 7z path verifies CRCs too). Gate met: 1.61x upstream, and level
+because the 7z path verifies CRCs too). Gate met: 1.62x upstream, and level
 with `7zz` single-threaded rather than 1.3x behind it.
 
 `mt.7z` is still decoded single-threaded here — the multi-threaded LZMA2 path

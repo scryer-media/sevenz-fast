@@ -36,7 +36,7 @@ against. Upstream's own changelog continues below, unchanged.
 
 - LZMA (`0x030101`) and LZMA2 (`0x21`) are decoded by
   [`lzma-fast`](https://github.com/scryer-media/lzma-fast) instead of
-  `lzma-rust2`. On the fixtures in `docs/benchmarking.md` this is 1.61x
+  `lzma-rust2`. On the fixtures in `docs/benchmarking.md` this is 1.62x
   upstream's throughput and level with `7zz t -mmt=1`, where upstream was 1.3x
   behind it.
 - `lzma-rust2` has left the library's runtime dependency graph. It remains an
