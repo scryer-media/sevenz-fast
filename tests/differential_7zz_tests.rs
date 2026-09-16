@@ -6,6 +6,12 @@
 //! it to". So every case here builds an archive with `7zz a`, extracts it twice
 //! (once with `7zz x`, once with this crate) and compares the bytes.
 //!
+//! Every case is extracted three times by this crate — single-threaded, with
+//! eight threads, and through the adaptive coder while the ceiling is one —
+//! and all three are compared against `7zz`'s own extraction. The thread count
+//! must not be able to change a byte: a run boundary is a dictionary reset, so
+//! which decoder took which run is not observable in the output.
+//!
 //! `7zz` is not installed on the CI runners, so the whole file skips itself
 //! when `7zz` is not on `PATH`. Run it locally before proposing a decoder
 //! change; `docs/benchmarking.md` records the matrix it covers.
@@ -114,10 +120,42 @@ fn tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
     out
 }
 
+/// How this crate should decode a case.
+#[derive(Debug, Clone, Copy)]
+struct Lane {
+    name: &'static str,
+    threads: u32,
+    adaptive: bool,
+}
+
+const LANES: [Lane; 3] = [
+    Lane {
+        name: "threads=1",
+        threads: 1,
+        adaptive: false,
+    },
+    Lane {
+        name: "threads=8",
+        threads: 8,
+        adaptive: false,
+    },
+    Lane {
+        name: "adaptive, threads=1",
+        threads: 1,
+        adaptive: true,
+    },
+];
+
 /// Extracts `archive` with this crate, into the same shape `tree` returns.
-fn extract_with_crate(archive: &Path, password: &Password) -> BTreeMap<String, Vec<u8>> {
+fn extract_with_crate(
+    archive: &Path,
+    password: &Password,
+    lane: Lane,
+) -> BTreeMap<String, Vec<u8>> {
     let file = std::fs::File::open(archive).expect("open archive");
     let mut reader = ArchiveReader::new(file, password.clone()).expect("read archive");
+    reader.set_threads(lane.threads);
+    reader.set_adaptive_lzma2(lane.adaptive);
     let mut out = BTreeMap::new();
     reader
         .for_each_entries(|entry, rd| {
@@ -194,23 +232,26 @@ fn differential(case: &str, archive_args: &[&str], password: Option<&str>) {
     assert!(!oracle.is_empty(), "{case}: 7zz extracted nothing");
 
     let password = password.map_or_else(Password::empty, Password::from);
-    let ours = extract_with_crate(&archive, &password);
+    for lane in LANES {
+        let ours = extract_with_crate(&archive, &password, lane);
+        let case = format!("{case} [{}]", lane.name);
 
-    assert_eq!(
-        ours.keys().collect::<Vec<_>>(),
-        oracle.keys().collect::<Vec<_>>(),
-        "{case}: member list differs"
-    );
-    for (name, expected) in &oracle {
-        let got = &ours[name];
         assert_eq!(
-            got.len(),
-            expected.len(),
-            "{case}: {name} length differs ({} vs {})",
-            got.len(),
-            expected.len()
+            ours.keys().collect::<Vec<_>>(),
+            oracle.keys().collect::<Vec<_>>(),
+            "{case}: member list differs"
         );
-        assert!(got == expected, "{case}: {name} bytes differ");
+        for (name, expected) in &oracle {
+            let got = &ours[name];
+            assert_eq!(
+                got.len(),
+                expected.len(),
+                "{case}: {name} length differs ({} vs {})",
+                got.len(),
+                expected.len()
+            );
+            assert!(got == expected, "{case}: {name} bytes differ");
+        }
     }
 }
 
