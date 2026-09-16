@@ -4,8 +4,8 @@ use std::{
     fs::File,
     io,
     io::{Read, Seek, SeekFrom},
-    num::NonZeroUsize,
     rc::Rc,
+    sync::Arc,
 };
 
 use lzma_fast::crc::{Crc32, crc32};
@@ -16,8 +16,9 @@ use crate::{
     bitset::BitSet,
     block::*,
     codec::filter::bcj2::Bcj2Reader,
-    container::{ArchiveLimits, BlockCompletion},
-    decoder::add_decoder,
+    codec::lzma_fast::{Lzma2Control, Lzma2Handle, Lzma2Progress},
+    container::{ArchiveLimits, BlockCompletion, SubStreamCompletion},
+    decoder::{DecodeOptions, add_decoder},
     error::Error,
 };
 
@@ -136,6 +137,9 @@ struct Crc32VerifyingReader<R> {
     crc_digest: Crc32,
     expected_value: u64,
     remaining: i64,
+    /// Where to leave the checksum once it is final, for a caller that wants
+    /// the value and not only the verdict. See [`SubStreamCompletion`].
+    report: Option<Rc<Cell<Option<u32>>>>,
 }
 
 impl<R: Read> Crc32VerifyingReader<R> {
@@ -145,6 +149,20 @@ impl<R: Read> Crc32VerifyingReader<R> {
             crc_digest: Crc32::new(),
             expected_value,
             remaining: remaining as i64,
+            report: None,
+        }
+    }
+
+    /// Same, and hands the computed checksum to `report` when it matches.
+    fn reporting(
+        inner: R,
+        remaining: usize,
+        expected_value: u64,
+        report: Rc<Cell<Option<u32>>>,
+    ) -> Self {
+        Self {
+            report: Some(report),
+            ..Self::new(inner, remaining, expected_value)
         }
     }
 }
@@ -163,6 +181,9 @@ impl<R: Read> Read for Crc32VerifyingReader<R> {
             let d = std::mem::replace(&mut self.crc_digest, Crc32::new()).finalize();
             if d as u64 != self.expected_value {
                 return Err(std::io::Error::other(Error::ChecksumVerificationFailed));
+            }
+            if let Some(report) = self.report.as_ref() {
+                report.set(Some(d));
             }
         }
         Ok(size)
@@ -268,9 +289,20 @@ impl Archive {
         };
         if header_valid {
             let start_header = Self::read_start_header(reader, start_header_crc)?;
-            Self::init_archive(reader, start_header, password, true, 1, limits)
+            Self::init_archive(
+                reader,
+                start_header,
+                password,
+                true,
+                &DecodeOptions::header(limits),
+            )
         } else {
-            Self::try_to_locale_end_header(reader, reader_len, password, 1, limits)
+            Self::try_to_locale_end_header(
+                reader,
+                reader_len,
+                password,
+                &DecodeOptions::header(limits),
+            )
         }
     }
 
@@ -341,8 +373,7 @@ impl Archive {
         reader: &mut R,
         reader_len: u64,
         password: &Password,
-        thread_count: u32,
-        limits: &ArchiveLimits,
+        opts: &DecodeOptions<'_>,
     ) -> Result<Self, Error> {
         let search_limit = 1024 * 1024;
         let prev_data_size = reader.stream_position()? + 20;
@@ -369,14 +400,7 @@ impl Archive {
                     next_header_size: reader_len - pos,
                     next_header_crc: 0,
                 };
-                let result = Self::init_archive(
-                    reader,
-                    start_header,
-                    password,
-                    false,
-                    thread_count,
-                    limits,
-                )?;
+                let result = Self::init_archive(reader, start_header, password, false, opts)?;
 
                 if !result.files.is_empty() {
                     return Ok(result);
@@ -393,14 +417,13 @@ impl Archive {
         start_header: StartHeader,
         password: &Password,
         verify_crc: bool,
-        thread_count: u32,
-        limits: &ArchiveLimits,
+        opts: &DecodeOptions<'_>,
     ) -> Result<Self, Error> {
         // The caller's own bound comes first: this number is read out of the
         // archive's first 32 bytes and the header below is buffered in full.
-        if start_header.next_header_size > limits.max_end_header_bytes {
+        if start_header.next_header_size > opts.limits.max_end_header_bytes {
             return Err(Error::EndHeaderTooLarge {
-                limit_bytes: limits.max_end_header_bytes,
+                limit_bytes: opts.limits.max_end_header_bytes,
                 declared_bytes: start_header.next_header_size,
             });
         }
@@ -443,8 +466,7 @@ impl Archive {
                 &mut archive,
                 password,
                 next_header_size_int,
-                thread_count,
-                limits,
+                opts,
             )?;
             // Read the decoded header lazily instead of pre-allocating `buf_size` bytes:
             // a crafted encoded header can declare a huge unpack size, and `resize`
@@ -495,8 +517,7 @@ impl Archive {
         archive: &mut Archive,
         password: &Password,
         limit: usize,
-        thread_count: u32,
-        limits: &ArchiveLimits,
+        opts: &DecodeOptions<'_>,
     ) -> Result<(Box<dyn Read + 'r>, usize), Error> {
         Self::read_streams_info(header, archive, limit)?;
         let block = archive
@@ -529,8 +550,7 @@ impl Archive {
                     block.get_unpack_size_at_index(index) as usize,
                     coder,
                     password,
-                    limits.memory_limit_kb(),
-                    thread_count,
+                    opts,
                 )?;
                 decoder = Box::new(next);
             }
@@ -538,7 +558,12 @@ impl Archive {
         } else {
             decoder
         };
-        if block.has_crc {
+        // The block checksum is verified by folding the workers' own segments
+        // when the parallel coder computed them; wrapping the stream here as
+        // well would put a CRC-32 back on the consuming thread, which is the
+        // one place the multi-threaded path must not spend time. See
+        // `BlockDecoder::for_each_entries`.
+        if block.has_crc && opts.verify_checksums && !opts.folding_checksums() {
             decoder = Box::new(Crc32VerifyingReader::new(decoder, unpack_size, block.crc));
         }
 
@@ -1316,10 +1341,15 @@ pub struct ArchiveReader<R: Read + Seek> {
     archive: Archive,
     password: Password,
     thread_count: u32,
+    adaptive_lzma2: bool,
+    verify_checksums: bool,
+    lzma2: Arc<Lzma2Control>,
     index: HashMap<String, IndexEntry>,
     limits: ArchiveLimits,
     #[allow(clippy::type_complexity)]
     on_block_complete: Option<Box<dyn FnMut(BlockCompletion) + Send>>,
+    #[allow(clippy::type_complexity)]
+    on_sub_stream_complete: Option<Box<dyn FnMut(SubStreamCompletion) + Send>>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1388,17 +1418,22 @@ impl<R: Read + Seek> ArchiveReader<R> {
             source,
             archive,
             password,
+            // One thread unless the caller asks for more. A reader that is
+            // handed to something with its own idea of how many threads it
+            // may use — which is every consumer this fork exists for — must
+            // not quietly spawn `available_parallelism()` of them, and must
+            // not quietly hold the memory that decoding in parallel needs.
             thread_count: 1,
+            adaptive_lzma2: false,
+            verify_checksums: true,
+            lzma2: Arc::new(Lzma2Control::new(1)),
             index: HashMap::default(),
             limits,
             on_block_complete: None,
+            on_sub_stream_complete: None,
         };
 
         reader.fill_index();
-
-        let thread_count =
-            std::thread::available_parallelism().unwrap_or(NonZeroUsize::new(1).unwrap());
-        reader.set_thread_count(thread_count.get() as u32);
 
         Ok(reader)
     }
@@ -1423,6 +1458,28 @@ impl<R: Read + Seek> ArchiveReader<R> {
         self.on_block_complete = None;
     }
 
+    /// Calls `hook` as each file's CRC-32 becomes final, with the value.
+    ///
+    /// The reader already checksums every file it decodes, to check it against
+    /// the header; this hands the number over rather than discarding it, so a
+    /// consumer can report per-file integrity without reading the bytes a
+    /// second time. The hook fires after the entry callback returns for that
+    /// file, once per file the archive records a checksum for, in order.
+    ///
+    /// A failed check never reaches the hook: it is
+    /// [`Error::ChecksumVerificationFailed`] out of the entry callback.
+    pub fn set_sub_stream_complete_hook(
+        &mut self,
+        hook: impl FnMut(SubStreamCompletion) + Send + 'static,
+    ) {
+        self.on_sub_stream_complete = Some(Box::new(hook));
+    }
+
+    /// Drops any hook set by [`ArchiveReader::set_sub_stream_complete_hook`].
+    pub fn clear_sub_stream_complete_hook(&mut self) {
+        self.on_sub_stream_complete = None;
+    }
+
     /// The limits this reader was built with.
     #[must_use]
     pub fn limits(&self) -> ArchiveLimits {
@@ -1444,14 +1501,21 @@ impl<R: Read + Seek> ArchiveReader<R> {
         if block_index >= self.archive.blocks.len() {
             return Err(Error::FileNotFound);
         }
-        Ok(BlockDecoder::with_limits(
-            self.thread_count,
+        Ok(BlockDecoder {
+            thread_count: self.thread_count,
+            adaptive_lzma2: self.adaptive_lzma2,
+            verify_checksums: self.verify_checksums,
+            lzma2: Arc::clone(&self.lzma2),
             block_index,
-            &self.archive,
-            &self.password,
-            &mut self.source,
-            self.limits,
-        ))
+            archive: &self.archive,
+            password: &self.password,
+            source: &mut self.source,
+            limits: self.limits,
+            on_sub_stream_complete: self
+                .on_sub_stream_complete
+                .as_mut()
+                .map(|hook| &mut **hook as &mut (dyn FnMut(SubStreamCompletion) + Send + '_)),
+        })
     }
 
     /// The source this reader is reading from.
@@ -1485,26 +1549,117 @@ impl<R: Read + Seek> ArchiveReader<R> {
             archive,
             password,
             thread_count: 1,
+            adaptive_lzma2: false,
+            verify_checksums: true,
+            lzma2: Arc::new(Lzma2Control::new(1)),
             index: HashMap::default(),
             limits: ArchiveLimits::default(),
             on_block_complete: None,
+            on_sub_stream_complete: None,
         };
 
         reader.fill_index();
 
-        let thread_count =
-            std::thread::available_parallelism().unwrap_or(NonZeroUsize::new(1).unwrap());
-        reader.set_thread_count(thread_count.get() as u32);
-
         reader
     }
 
-    /// Sets the thread count to use when multi-threading is supported by the de-compression
-    /// (currently only LZMA2 if encoded with MT support).
+    /// Sets how many threads one block's LZMA2 coder may decode on, clamped
+    /// to `1..=256`.
     ///
-    /// Defaults to `std::thread::available_parallelism()` if not set manually.
+    /// **The default is one**, which is the behaviour of every other coder in
+    /// this crate and the behaviour this fork had before the parallel path
+    /// existed: nothing is spawned, nothing is buffered, and the memory a
+    /// decode needs is the dictionary. Upstream `sevenz-rust2` defaults this
+    /// to `available_parallelism()`; a library that decides on its own to
+    /// occupy every core and to hold a gigabyte while doing it is not a
+    /// default a consumer can build a memory budget on, so the fork asks.
+    ///
+    /// The count takes effect at the next LZMA2 **run boundary**, so changing
+    /// it during a decode is allowed and lossless — a run begins with a
+    /// dictionary reset, which is exactly where one decoder can hand over to
+    /// another. A count of `1` means the next run is decoded inline on the
+    /// calling thread; already-spawned workers park on their channel and cost
+    /// nothing until it goes back up.
+    ///
+    /// A block only decodes in parallel at all if its coder was built for it:
+    /// see [`ArchiveReader::set_adaptive_lzma2`] for starting at one thread
+    /// and widening later.
+    pub fn set_threads(&mut self, threads: u32) {
+        self.thread_count = threads.clamp(1, 256);
+        self.lzma2.set_threads(self.thread_count);
+    }
+
+    /// [`ArchiveReader::set_threads`], for a builder chain.
+    #[must_use]
+    pub fn with_threads(mut self, threads: u32) -> Self {
+        self.set_threads(threads);
+        self
+    }
+
+    /// The thread ceiling currently in force.
+    pub fn threads(&self) -> u32 {
+        self.thread_count
+    }
+
+    /// Upstream's name for [`ArchiveReader::set_threads`].
     pub fn set_thread_count(&mut self, thread_count: u32) {
-        self.thread_count = thread_count.clamp(1, 256);
+        self.set_threads(thread_count);
+    }
+
+    /// Builds each block's LZMA2 coder so that it *can* widen later, even
+    /// while the thread count is one.
+    ///
+    /// The choice between the plain decoder and the adaptive one is made when
+    /// a block's coder is built, because the plain one is what costs nothing
+    /// and a caller who never asked for threads must keep paying nothing. A
+    /// consumer that intends to chase a download — decode with one thread
+    /// while the tail is arriving, widen once a backlog of complete runs has
+    /// built up, narrow again — asks for this once, leaves the count at one,
+    /// and then drives [`Lzma2Handle::set_threads`] as it goes.
+    pub fn set_adaptive_lzma2(&mut self, adaptive: bool) {
+        self.adaptive_lzma2 = adaptive;
+    }
+
+    /// [`ArchiveReader::set_adaptive_lzma2`], for a builder chain.
+    #[must_use]
+    pub fn with_adaptive_lzma2(mut self) -> Self {
+        self.set_adaptive_lzma2(true);
+        self
+    }
+
+    /// Whether the header's CRC-32s are checked as the archive is decoded.
+    /// On by default, which is what almost every caller wants.
+    ///
+    /// Turning it off is for a consumer that verifies the bytes by other
+    /// means — a PAR2 set over the extracted files, say — and does not want to
+    /// pay for the same assurance twice. With it off, a corrupt archive is
+    /// decoded into corrupt bytes without complaint: this crate then reports
+    /// only what the decoder itself notices, which is far less than a
+    /// checksum notices. It exists to be measured against, too: a decode with
+    /// it off is the floor the checked decode is compared with.
+    pub fn set_verify_checksums(&mut self, verify: bool) {
+        self.verify_checksums = verify;
+    }
+
+    /// [`ArchiveReader::set_verify_checksums`], for a builder chain.
+    #[must_use]
+    pub fn with_verify_checksums(mut self, verify: bool) -> Self {
+        self.verify_checksums = verify;
+        self
+    }
+
+    /// A handle on the LZMA2 coder of whichever block is decoding, which can
+    /// be held and used while this reader is borrowed by a decode.
+    pub fn lzma2_handle(&self) -> Lzma2Handle {
+        Lzma2Handle {
+            control: Arc::clone(&self.lzma2),
+        }
+    }
+
+    /// What the LZMA2 coder of the block being decoded is doing right now, or
+    /// `None` when no block is decoding through the adaptive path.
+    pub fn lzma2_progress(&self) -> Option<Lzma2Progress> {
+        self.lzma2.progress()
     }
 
     fn fill_index(&mut self) {
@@ -1535,19 +1690,11 @@ impl<R: Read + Seek> ArchiveReader<R> {
         archive: &Archive,
         block_index: usize,
         password: &Password,
-        thread_count: u32,
-        limits: &ArchiveLimits,
+        opts: &DecodeOptions<'_>,
     ) -> Result<(Box<dyn Read + 'r>, usize), Error> {
         let block = &archive.blocks[block_index];
         if block.total_input_streams > block.total_output_streams {
-            return Self::build_decode_stack2(
-                source,
-                archive,
-                block_index,
-                password,
-                thread_count,
-                limits,
-            );
+            return Self::build_decode_stack2(source, archive, block_index, password, opts);
         }
         let first_pack_stream_index = archive.stream_map.block_first_pack_stream_index[block_index];
         let block_offset = SIGNATURE_HEADER_SIZE
@@ -1590,8 +1737,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
                 block.get_unpack_size_at_index(index) as usize,
                 coder,
                 password,
-                limits.memory_limit_kb(),
-                thread_count,
+                opts,
             )?;
             decoder = Box::new(next);
         }
@@ -1611,8 +1757,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
         archive: &Archive,
         block_index: usize,
         password: &Password,
-        thread_count: u32,
-        limits: &ArchiveLimits,
+        opts: &DecodeOptions<'_>,
     ) -> Result<(Box<dyn Read + 'r>, usize), Error> {
         const MAX_CODER_COUNT: usize = 32;
         let block = &archive.blocks[block_index];
@@ -1689,8 +1834,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
             password,
             main_coder_index,
             0,
-            thread_count,
-            limits,
+            opts,
         )?;
         if block.has_crc {
             decoder = Box::new(Crc32VerifyingReader::new(
@@ -1717,8 +1861,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
         password: &Password,
         in_stream_index: usize,
         depth: usize,
-        thread_count: u32,
-        limits: &ArchiveLimits,
+        opts: &DecodeOptions<'_>,
     ) -> Result<Box<dyn Read + 'r>, Error>
     where
         R: 'r,
@@ -1747,8 +1890,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
             password,
             index,
             depth,
-            thread_count,
-            limits,
+            opts,
         )
     }
 
@@ -1764,8 +1906,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
         password: &Password,
         in_stream_index: usize,
         depth: usize,
-        thread_count: u32,
-        limits: &ArchiveLimits,
+        opts: &DecodeOptions<'_>,
     ) -> Result<Box<dyn Read + 'r>, Error>
     where
         R: 'r,
@@ -1798,18 +1939,10 @@ impl<R: Read + Seek> ArchiveReader<R> {
                 password,
                 start_index,
                 depth + 1,
-                thread_count,
-                limits,
+                opts,
             )?;
 
-            let decoder = add_decoder(
-                input,
-                uncompressed_len,
-                coder,
-                password,
-                limits.memory_limit_kb(),
-                thread_count,
-            )?;
+            let decoder = add_decoder(input, uncompressed_len, coder, password, opts)?;
             return Ok(Box::new(decoder));
         }
 
@@ -1833,8 +1966,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
                     password,
                     i,
                     depth + 1,
-                    thread_count,
-                    limits,
+                    opts,
                 )?);
             }
             return Ok(Box::new(Bcj2Reader::new(inputs, uncompressed_len as u64)));
@@ -1857,14 +1989,21 @@ impl<R: Read + Seek> ArchiveReader<R> {
     ) -> Result<(), Error> {
         let block_count = self.archive.blocks.len();
         for block_index in 0..block_count {
-            let block_decoder = BlockDecoder::with_limits(
-                self.thread_count,
+            let block_decoder = BlockDecoder {
+                thread_count: self.thread_count,
+                adaptive_lzma2: self.adaptive_lzma2,
+                verify_checksums: self.verify_checksums,
+                lzma2: Arc::clone(&self.lzma2),
                 block_index,
-                &self.archive,
-                &self.password,
-                &mut self.source,
-                self.limits,
-            );
+                archive: &self.archive,
+                password: &self.password,
+                source: &mut self.source,
+                limits: self.limits,
+                on_sub_stream_complete: self
+                    .on_sub_stream_complete
+                    .as_mut()
+                    .map(|hook| &mut **hook as &mut (dyn FnMut(SubStreamCompletion) + Send + '_)),
+            };
             let finished = block_decoder.for_each_entries(&mut each)?;
 
             if let Some(hook) = self.on_block_complete.as_mut() {
@@ -1929,13 +2068,20 @@ impl<R: Read + Seek> ArchiveReader<R> {
                 let mut result = None;
                 let target_file_ptr = file as *const _;
 
-                BlockDecoder::new(
-                    self.thread_count,
+                BlockDecoder {
+                    thread_count: self.thread_count,
+                    adaptive_lzma2: self.adaptive_lzma2,
+                    verify_checksums: self.verify_checksums,
+                    lzma2: Arc::clone(&self.lzma2),
                     block_index,
-                    &self.archive,
-                    &self.password,
-                    &mut self.source,
-                )
+                    archive: &self.archive,
+                    password: &self.password,
+                    source: &mut self.source,
+                    limits: self.limits,
+                    on_sub_stream_complete: self.on_sub_stream_complete.as_mut().map(|hook| {
+                        &mut **hook as &mut (dyn FnMut(SubStreamCompletion) + Send + '_)
+                    }),
+                }
                 .for_each_entries(&mut |archive_entry, reader| {
                     let mut data =
                         Vec::with_capacity((archive_entry.size as usize).min(MAX_PREALLOC_BYTES));
@@ -1961,13 +2107,23 @@ impl<R: Read + Seek> ArchiveReader<R> {
 
                 self.source.seek(SeekFrom::Start(block_offset))?;
 
+                let opts = DecodeOptions {
+                    limits: &self.limits,
+                    threads: self.thread_count,
+                    adaptive_lzma2: self.adaptive_lzma2,
+                    verify_checksums: self.verify_checksums,
+                    lzma2_control: Some(&self.lzma2),
+                    // One file is read here and its checksum is verified as it
+                    // streams past; there are no other boundaries to declare.
+                    checksum_splits: &[],
+                };
+                self.lzma2.set_block_index(block_index);
                 let (mut block_reader, _size) = Self::build_decode_stack(
                     &mut self.source,
                     &self.archive,
                     block_index,
                     &self.password,
-                    self.thread_count,
-                    &self.limits,
+                    &opts,
                 )?;
 
                 let mut data = Vec::with_capacity((file.size as usize).min(MAX_PREALLOC_BYTES));
@@ -2030,11 +2186,16 @@ impl<R: Read + Seek> ArchiveReader<R> {
 /// decoding files from that block.
 pub struct BlockDecoder<'a, R: Read + Seek> {
     thread_count: u32,
+    adaptive_lzma2: bool,
+    verify_checksums: bool,
+    lzma2: Arc<Lzma2Control>,
     block_index: usize,
     archive: &'a Archive,
     password: &'a Password,
     source: &'a mut R,
     limits: ArchiveLimits,
+    #[allow(clippy::type_complexity)]
+    on_sub_stream_complete: Option<&'a mut (dyn FnMut(SubStreamCompletion) + Send + 'a)>,
 }
 
 impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
@@ -2078,20 +2239,62 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
         source: &'a mut R,
         limits: ArchiveLimits,
     ) -> Self {
+        let thread_count = thread_count.clamp(1, 256);
         Self {
             thread_count,
+            adaptive_lzma2: false,
+            verify_checksums: true,
+            lzma2: Arc::new(Lzma2Control::new(thread_count)),
             block_index,
             archive,
             password,
             source,
             limits,
+            on_sub_stream_complete: None,
         }
     }
 
-    /// Sets the thread count to use when multi-threading is supported by the de-compression
-    /// (currently only LZMA2 if encoded with MT support).
+    /// Sets how many threads this block's LZMA2 coder may decode on, clamped
+    /// to `1..=256`. See [`ArchiveReader::set_threads`].
+    pub fn set_threads(&mut self, threads: u32) {
+        self.thread_count = threads.clamp(1, 256);
+        self.lzma2.set_threads(self.thread_count);
+    }
+
+    /// [`BlockDecoder::set_threads`], for a builder chain.
+    #[must_use]
+    pub fn with_threads(mut self, threads: u32) -> Self {
+        self.set_threads(threads);
+        self
+    }
+
+    /// Upstream's name for [`BlockDecoder::set_threads`].
     pub fn set_thread_count(&mut self, thread_count: u32) {
-        self.thread_count = thread_count.clamp(1, 256);
+        self.set_threads(thread_count);
+    }
+
+    /// Builds this block's LZMA2 coder so that it can widen later even while
+    /// the thread count is one. See [`ArchiveReader::set_adaptive_lzma2`].
+    #[must_use]
+    pub fn with_adaptive_lzma2(mut self) -> Self {
+        self.adaptive_lzma2 = true;
+        self
+    }
+
+    /// Whether this block's checksums are checked. See
+    /// [`ArchiveReader::set_verify_checksums`].
+    #[must_use]
+    pub fn with_verify_checksums(mut self, verify: bool) -> Self {
+        self.verify_checksums = verify;
+        self
+    }
+
+    /// A handle on this block's LZMA2 coder, which can be held and used while
+    /// the decode is running.
+    pub fn lzma2_handle(&self) -> Lzma2Handle {
+        Lzma2Handle {
+            control: Arc::clone(&self.lzma2),
+        }
     }
 
     /// Returns a slice of archive entries contained in this block.
@@ -2120,27 +2323,47 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
     ) -> Result<bool, Error> {
         let Self {
             thread_count,
+            adaptive_lzma2,
+            verify_checksums,
+            lzma2,
             block_index,
             archive,
             password,
             source,
             limits,
+            mut on_sub_stream_complete,
         } = self;
+        // Where each of this block's files starts in its decoded stream. Handed
+        // to the LZMA2 coder so that, if it decodes in parallel, each worker
+        // checksums the pieces of its own output between those points, and no
+        // CRC-32 is ever computed on the thread delivering the bytes.
+        let splits = if verify_checksums {
+            Self::file_boundaries(archive, block_index)
+        } else {
+            Vec::new()
+        };
+        let opts = DecodeOptions {
+            limits: &limits,
+            threads: thread_count,
+            adaptive_lzma2,
+            verify_checksums,
+            lzma2_control: Some(&lzma2),
+            checksum_splits: &splits,
+        };
+        lzma2.set_block_index(block_index);
         // Where this block's packed bytes start, so a failure below can say
         // which region of the file it was reading.
         let packed_offset = archive
             .block_pack_streams(block_index)
             .first()
             .map_or(0, |range| range.offset);
-        let (block_reader, _size) = ArchiveReader::build_decode_stack(
-            source,
-            archive,
-            block_index,
-            password,
-            thread_count,
-            &limits,
-        )
-        .map_err(|error| error.in_block(block_index, packed_offset))?;
+        let (block_reader, _size) =
+            ArchiveReader::build_decode_stack(source, archive, block_index, password, &opts)
+                .map_err(|error| error.in_block(block_index, packed_offset))?;
+        // Read once, here: the coder is built and has either engaged the
+        // parallel path or degraded to the single-threaded one, and it stops
+        // reporting as soon as the block finishes.
+        let folding = opts.folding_checksums();
         let faulted = Rc::new(Cell::new(false));
         let mut block_reader = FaultRecordingReader {
             inner: block_reader,
@@ -2149,16 +2372,26 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
         let start = archive.stream_map.block_first_file_index[block_index];
         let file_count = archive.blocks[block_index].num_unpack_sub_streams;
 
+        let first_sub_stream = archive.stream_map.block_first_sub_stream_index[block_index];
+        // Where each file starts inside the block's uncompressed stream: the
+        // coordinate the parallel decoder's output blocks carry, so a folded
+        // checksum and a file are in the same space.
+        let mut unpacked_offset = 0u64;
+        let mut sub_stream = 0usize;
+        let crc_report = Rc::new(Cell::new(None));
+
         for file_index in start..(file_count + start) {
             let file = &archive.files[file_index];
             if file.has_stream && file.size > 0 {
                 let mut decoder: Box<dyn Read> =
                     Box::new(BoundedReader::new(&mut block_reader, file.size as usize));
-                if file.has_crc {
-                    decoder = Box::new(Crc32VerifyingReader::new(
+                if file.has_crc && verify_checksums && !folding {
+                    crc_report.set(None);
+                    decoder = Box::new(Crc32VerifyingReader::reporting(
                         decoder,
                         file.size as usize,
                         file.crc,
+                        Rc::clone(&crc_report),
                     ));
                 }
                 let outcome = each(file, &mut decoder)
@@ -2173,16 +2406,109 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
                             e
                         }
                     })?;
+                if folding {
+                    // The workers checksummed this file's bytes as they
+                    // produced them; folding the pieces is a few multiplies
+                    // over GF(2), and reads none of them back. A range that is
+                    // not covered means the callback left bytes unread, which
+                    // is not a checksum failure and is not reported as one.
+                    if let Some(crc32) = lzma2.folded(unpacked_offset, file.size) {
+                        if file.has_crc && u64::from(crc32) != file.crc {
+                            return Err(Error::ChecksumVerificationFailed
+                                .in_block(block_index, packed_offset));
+                        }
+                        crc_report.set(Some(crc32));
+                    }
+                }
+                if let (Some(hook), Some(crc32)) =
+                    (on_sub_stream_complete.as_deref_mut(), crc_report.take())
+                {
+                    hook(SubStreamCompletion {
+                        block_index,
+                        sub_stream_index: first_sub_stream + sub_stream,
+                        file_index,
+                        unpacked_offset,
+                        len: file.size,
+                        crc32,
+                    });
+                }
+                unpacked_offset += file.size;
+                sub_stream += 1;
                 if !outcome {
                     return Ok(false);
                 }
             } else {
+                if file.has_stream {
+                    sub_stream += 1;
+                }
                 let empty_reader: &mut dyn Read = &mut ([0u8; 0].as_slice());
                 if !each(file, empty_reader)? {
                     return Ok(false);
                 }
             }
         }
+        if folding
+            && archive.blocks[block_index].has_crc
+            && let Some(crc32) = lzma2.folded(0, archive.blocks[block_index].get_unpack_size())
+            && u64::from(crc32) != archive.blocks[block_index].crc
+        {
+            // The block's own checksum, folded from the same segments: the
+            // stream was not wrapped in a verifying reader, because that
+            // reader runs on the thread delivering the bytes.
+            return Err(Error::ChecksumVerificationFailed.in_block(block_index, packed_offset));
+        }
         Ok(true)
+    }
+
+    /// The offsets this block's files start at in its decoded stream, without
+    /// the leading zero: the split points a parallel LZMA2 coder checksums
+    /// between.
+    ///
+    /// Empty when there is nothing to gain — a block whose only checksum is
+    /// its own needs no interior boundary, and one with no checksums at all
+    /// needs none either.
+    fn file_boundaries(archive: &Archive, block_index: usize) -> Vec<u64> {
+        let block = &archive.blocks[block_index];
+        // The workers checksum what the LZMA2 coder produces. That is the
+        // block's output only when LZMA2 *is* the block's coder: a filter
+        // above it — BCJ, delta, BCJ2 — rewrites those bytes on the way out,
+        // and a checksum taken underneath it would be of bytes nobody ever
+        // sees. Such a block keeps the streaming checksum on the consuming
+        // thread, which is where it has to happen, because the filter runs
+        // there too.
+        if block.coders.len() != 1 {
+            return Vec::new();
+        }
+        let start = archive.stream_map.block_first_file_index[block_index];
+        let files = archive
+            .files
+            .iter()
+            .skip(start)
+            .take(block.num_unpack_sub_streams);
+        let mut offsets = Vec::new();
+        let mut at = 0u64;
+        let mut wanted = block.has_crc;
+        for file in files {
+            if file.has_stream && file.size > 0 {
+                wanted |= file.has_crc;
+                if at != 0 {
+                    offsets.push(at);
+                }
+                at += file.size;
+            }
+        }
+        if !wanted {
+            // Nothing in this block is checked, so there is nothing to compute
+            // and no reason to make the workers do it.
+            return Vec::new();
+        }
+        if offsets.is_empty() {
+            // One stream: its range is the whole block, which a worker
+            // checksums without being given any interior point. The plan still
+            // has to be asked for, and an offset past the end of the stream is
+            // how it is asked for with no point inside it.
+            return vec![u64::MAX];
+        }
+        offsets
     }
 }

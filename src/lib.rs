@@ -78,7 +78,7 @@ mod writer;
 pub(crate) mod archive;
 pub(crate) mod bitset;
 pub(crate) mod block;
-mod codec;
+pub(crate) mod codec;
 pub(crate) mod decoder;
 
 mod time;
@@ -92,8 +92,10 @@ use std::{
 
 pub use archive::*;
 pub use block::*;
+pub use codec::lzma_fast::{Lzma2Handle, Lzma2Progress};
 pub use container::{
-    ArchiveLimits, BlockCompletion, PackStreamRange, SubStream, UnsizedCoder, coder_memory_estimate,
+    ArchiveLimits, BlockCompletion, CrcFolder, PackStreamRange, SubStream, SubStreamCompletion,
+    UnsizedCoder, coder_memory_estimate, crc32_combine,
 };
 pub use encryption::Password;
 pub use error::{BlockErrorKind, Error};

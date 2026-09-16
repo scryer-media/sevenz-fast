@@ -1,10 +1,11 @@
 use std::io::Read;
+use std::sync::Arc;
 
 #[cfg(feature = "bzip2")]
 use bzip2::read::BzDecoder;
 #[cfg(feature = "deflate")]
 use flate2::bufread::DeflateDecoder;
-use lzma_fast::{Lzma2Reader, LzmaReader};
+use lzma_fast::LzmaReader;
 #[cfg(feature = "ppmd")]
 use ppmd_rust::{
     PPMD7_MAX_MEM_SIZE, PPMD7_MAX_ORDER, PPMD7_MIN_MEM_SIZE, PPMD7_MIN_ORDER, Ppmd7Decoder,
@@ -16,16 +17,77 @@ use crate::codec::brotli::BrotliDecoder;
 use crate::codec::lz4::Lz4Decoder;
 use crate::codec::{
     filter::{bcj::BcjReader, delta::DeltaReader},
-    lzma_fast::{Lzma2Plan, lzma2_decoder, lzma2_dictionary_size, lzma2_memory_usage_kb},
+    lzma_fast::{
+        Lzma2Coder, Lzma2Control, Lzma2Plan, lzma2_decoder, lzma2_dictionary_size,
+        lzma2_memory_usage_kb,
+    },
 };
+use crate::container::ArchiveLimits;
 #[cfg(feature = "aes256")]
 use crate::encryption::Aes256Sha256Decoder;
 use crate::{Password, archive::EncoderMethod, block::Coder, error::Error};
 
+/// Everything a coder needs that is not in the archive: the caller's limits,
+/// how many threads they will allow, and the live link to the LZMA2 coder.
+///
+/// It replaces the two loose parameters (`max_mem_limit_kb`, `threads`) that
+/// upstream threads through the decode-stack builders. Bundling them is what
+/// lets the LZMA2 coder be handed a control block as well without every
+/// function between here and the reader growing a ninth argument.
+pub(crate) struct DecodeOptions<'a> {
+    /// What the caller will let the archive allocate.
+    pub(crate) limits: &'a ArchiveLimits,
+    /// Thread ceiling for coders that can use one. One means inline.
+    pub(crate) threads: u32,
+    /// Build the LZMA2 coder so it can widen later even at one thread.
+    pub(crate) adaptive_lzma2: bool,
+    /// Whether the header's checksums are to be checked at all. False only
+    /// when the caller has said it verifies the bytes by other means.
+    pub(crate) verify_checksums: bool,
+    /// The live link back to the reader, when there is one. The header decode
+    /// has none: it is one small block on the calling thread, before the
+    /// caller has had any chance to ask for anything else.
+    pub(crate) lzma2_control: Option<&'a Arc<Lzma2Control>>,
+    /// Where the consumer's boundaries fall in this block's decoded stream —
+    /// the offsets its files start at — so that a parallel LZMA2 coder can
+    /// checksum each piece in the worker that produced it. Empty when nothing
+    /// is to be checksummed there.
+    pub(crate) checksum_splits: &'a [u64],
+}
+
+impl<'a> DecodeOptions<'a> {
+    /// The options the header decode runs with: the caller's limits, one
+    /// thread, no live control.
+    pub(crate) fn header(limits: &'a ArchiveLimits) -> Self {
+        Self {
+            limits,
+            threads: 1,
+            adaptive_lzma2: false,
+            verify_checksums: true,
+            lzma2_control: None,
+            checksum_splits: &[],
+        }
+    }
+
+    /// Whether the checksums of this block are being computed by the LZMA2
+    /// workers rather than by whoever consumes the output.
+    ///
+    /// True only once the coder has actually been built and engaged the
+    /// parallel path: a plan can always degrade to the single-threaded
+    /// decoder, which computes no checksums, so the answer is read from the
+    /// live coder and not from what was asked for.
+    pub(crate) fn folding_checksums(&self) -> bool {
+        !self.checksum_splits.is_empty()
+            && self
+                .lzma2_control
+                .is_some_and(|control| control.progress().is_some())
+    }
+}
+
 pub enum Decoder<R: Read> {
     Copy(R),
     Lzma(Box<LzmaReader<R>>),
-    Lzma2(Box<Lzma2Reader<R>>),
+    Lzma2(Box<Lzma2Coder<R>>),
     #[cfg(feature = "ppmd")]
     Ppmd(Box<Ppmd7Decoder<R>>),
     Bcj(BcjReader<R>),
@@ -75,9 +137,9 @@ pub fn add_decoder<I: Read>(
     uncompressed_len: usize,
     coder: &Coder,
     #[allow(unused)] password: &Password,
-    max_mem_limit_kb: usize,
-    threads: u32,
+    opts: &DecodeOptions<'_>,
 ) -> Result<Decoder<I>, Error> {
+    let max_mem_limit_kb = opts.limits.memory_limit_kb();
     let method = EncoderMethod::by_id(coder.encoder_method_id());
     let method = if let Some(m) = method {
         m
@@ -118,7 +180,17 @@ pub fn add_decoder<I: Read>(
                 });
             }
 
-            let plan = Lzma2Plan::for_thread_count(threads);
+            let plan = match opts.lzma2_control {
+                Some(control) => Lzma2Plan::for_block(
+                    opts.threads,
+                    opts.adaptive_lzma2,
+                    opts.limits.memory_limit_bytes,
+                    dic_size,
+                    control,
+                    opts.checksum_splits,
+                ),
+                None => Lzma2Plan::SingleThreaded,
+            };
             let lz = lzma2_decoder(input, &coder.properties, plan)
                 .map_err(|e| Error::bad_password(e, !password.is_empty()))?;
             Ok(Decoder::Lzma2(Box::new(lz)))

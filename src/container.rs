@@ -145,6 +145,71 @@ pub struct BlockCompletion {
     pub crc_verified: bool,
 }
 
+/// One sub-stream — one file — whose CRC-32 has become final, reported to a
+/// completion hook as the decode reaches the end of it.
+///
+/// A 7z block holds a run of files whose bytes are one uncompressed stream,
+/// and `SubStreamsInfo` records a checksum per file rather than per block. A
+/// consumer that wants to report per-file integrity has, without this, to read
+/// the bytes a second time to checksum them. The decoder has already done that
+/// work — the reader checks each file's CRC against the header as it goes —
+/// so this hands the answer over instead of throwing it away.
+///
+/// The CRC reported here has already been checked against the header: a
+/// mismatch is [`Error::ChecksumVerificationFailed`] and the hook is never
+/// reached. Files the archive records no checksum for are not reported at all.
+///
+/// [`Error::ChecksumVerificationFailed`]: crate::Error::ChecksumVerificationFailed
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubStreamCompletion {
+    /// Index of the block in [`Archive::blocks`].
+    ///
+    /// [`Archive::blocks`]: crate::Archive::blocks
+    pub block_index: usize,
+    /// Index of the sub-stream in the archive's flat list, as
+    /// [`SubStream::index`] numbers them.
+    pub sub_stream_index: usize,
+    /// Index of the entry in [`Archive::files`].
+    ///
+    /// [`Archive::files`]: crate::Archive::files
+    pub file_index: usize,
+    /// Offset of this file's first byte within the block's uncompressed
+    /// stream. This is the coordinate the parallel decoder's output blocks
+    /// carry, so segments and files are in the same space.
+    pub unpacked_offset: u64,
+    /// Length of the file in bytes.
+    pub len: u64,
+    /// The CRC-32 of those bytes.
+    pub crc32: u32,
+}
+
+// ---------------------------------------------------------------------------
+// CRC folding
+// ---------------------------------------------------------------------------
+
+/// Combines two CRC-32s: the checksum of `a ++ b`, given the checksum of each
+/// piece and the length of the second.
+///
+/// A parallel decode computes a checksum per piece of output, on the thread
+/// that produced the piece. Turning those into the checksum of a whole file —
+/// or of a whole block, or of bytes spanning several blocks — is this, and it
+/// costs microseconds regardless of how long the pieces are, because it works
+/// on the polynomial rather than on the bytes.
+///
+/// This crate folds the pieces of a file itself; what is re-exported here is
+/// for a consumer folding across boundaries this crate does not know about,
+/// so that it does so with the same implementation the workers checksummed
+/// with rather than a second copy of it.
+pub use lzma_fast::crc::crc32_combine;
+
+/// Folds checksummed pieces into the checksum of any range they cover.
+///
+/// The pieces may be pushed in any order and are folded with
+/// [`crc32_combine`]; a range is answered only when the pieces cover it
+/// exactly. Use it to fold across blocks, or across whatever boundaries a
+/// consumer has that a 7z archive does not.
+pub use lzma_fast::crc::CrcFolder;
+
 // ---------------------------------------------------------------------------
 // Decoder memory model
 // ---------------------------------------------------------------------------
