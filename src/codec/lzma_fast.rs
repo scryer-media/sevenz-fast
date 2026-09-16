@@ -108,6 +108,18 @@ const MT_BUDGET_PER_THREAD_BYTES: u64 = 256 * 1024 * 1024;
 /// `7zz -mmt=on` writes, and packed runs are smaller than that.
 const MT_FEED_PER_THREAD_BYTES: u64 = 128 * 1024 * 1024;
 
+/// How much may be read ahead without a single worker having been spawned
+/// before the reader concludes that reading ahead is buying nothing.
+///
+/// A stream with no dictionary resets — what `7zz -mmt=1` writes — is one run
+/// from beginning to end, and a run is dispatched only once it has arrived
+/// whole, so reading ahead on such a stream buffers the entire archive to
+/// hand it to a single worker at the end. That is slower than decoding it as
+/// it arrives, and holds the whole archive in memory to be so. Past this
+/// point the reader stops getting ahead and lets the decoder stream, and it
+/// starts again the moment a worker does appear.
+const MT_NO_WORKER_GIVE_UP_BYTES: u64 = 256 * 1024 * 1024;
+
 /// The live link between an [`ArchiveReader`] and the LZMA2 coder that is
 /// decoding one of its blocks right now.
 ///
@@ -461,6 +473,9 @@ pub(crate) struct Lzma2MtReader<R: Read> {
     finished: bool,
     /// Whether the workers are computing checksums to be collected.
     checksums: bool,
+    /// Packed bytes handed to the decoder so far, to notice a stream whose
+    /// read-ahead is buying nothing. See [`MT_NO_WORKER_GIVE_UP_BYTES`].
+    fed_total: u64,
 }
 
 impl<R: Read> Lzma2MtReader<R> {
@@ -501,6 +516,7 @@ impl<R: Read> Lzma2MtReader<R> {
             out_pos: 0,
             finished: false,
             checksums,
+            fed_total: 0,
         })
     }
 
@@ -564,9 +580,12 @@ impl<R: Read> Lzma2MtReader<R> {
     /// full, which is the budget [`Lzma2Plan::for_block`] chose.
     fn pump_input(&mut self) -> std::io::Result<bool> {
         let mut fed = false;
-        let target = u64::from(self.applied_threads.max(1))
-            .saturating_mul(MT_FEED_PER_THREAD_BYTES)
-            .min(self.decoder.memory_limit());
+        let target = feed_target(
+            self.applied_threads,
+            self.fed_total,
+            self.decoder.spawned_threads(),
+            self.decoder.memory_limit(),
+        );
         loop {
             if self.decoder.in_flight_bytes() >= target {
                 break;
@@ -597,6 +616,7 @@ impl<R: Read> Lzma2MtReader<R> {
                 .feed(&self.inbuf[self.in_pos..])
                 .map_err(decode_error)?;
             self.in_pos += taken;
+            self.fed_total += taken as u64;
             fed |= taken > 0;
             if taken < offered {
                 // The decoder is holding all it is allowed to.
@@ -605,6 +625,20 @@ impl<R: Read> Lzma2MtReader<R> {
         }
         Ok(fed)
     }
+}
+
+/// How far ahead of the decoder to read, in packed bytes.
+///
+/// One run per thread, capped by the budget — and abandoned entirely once
+/// enough has been read with no worker to show for it, which is what a stream
+/// with no run boundaries looks like from here.
+fn feed_target(threads: u32, fed_total: u64, spawned: usize, memory_limit: u64) -> u64 {
+    if fed_total > MT_NO_WORKER_GIVE_UP_BYTES && spawned == 0 {
+        return MT_INPUT_CHUNK as u64;
+    }
+    u64::from(threads.max(1))
+        .saturating_mul(MT_FEED_PER_THREAD_BYTES)
+        .min(memory_limit)
 }
 
 impl<R: Read> Read for Lzma2MtReader<R> {
@@ -788,5 +822,44 @@ mod tests {
         props.extend_from_slice(&(8u32 << 20).to_le_bytes());
         assert_eq!(lzma_dictionary_size(&props).unwrap(), 8 << 20);
         assert!(lzma_dictionary_size(&[0x5D, 0, 0]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod feed_tests {
+    use super::{
+        MT_BUDGET_PER_THREAD_BYTES, MT_FEED_PER_THREAD_BYTES, MT_INPUT_CHUNK,
+        MT_NO_WORKER_GIVE_UP_BYTES, feed_target,
+    };
+
+    #[test]
+    fn it_reads_one_run_ahead_per_thread() {
+        let budget = 8 * MT_BUDGET_PER_THREAD_BYTES;
+        assert_eq!(
+            feed_target(8, 0, 1, budget),
+            8 * MT_FEED_PER_THREAD_BYTES,
+            "a run per thread is what a worker per thread needs"
+        );
+    }
+
+    #[test]
+    fn it_never_reads_further_ahead_than_the_budget() {
+        assert_eq!(feed_target(8, 0, 1, 64 << 20), 64 << 20);
+    }
+
+    #[test]
+    fn it_stops_reading_ahead_when_no_worker_has_appeared() {
+        let budget = 8 * MT_BUDGET_PER_THREAD_BYTES;
+        // A stream with no dictionary resets: nothing can ever be dispatched,
+        // so reading ahead would buffer the whole archive to gain nothing.
+        assert_eq!(
+            feed_target(8, MT_NO_WORKER_GIVE_UP_BYTES + 1, 0, budget),
+            MT_INPUT_CHUNK as u64
+        );
+        // And it starts again the moment one does appear.
+        assert_eq!(
+            feed_target(8, MT_NO_WORKER_GIVE_UP_BYTES + 1, 1, budget),
+            8 * MT_FEED_PER_THREAD_BYTES
+        );
     }
 }
