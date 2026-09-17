@@ -22,8 +22,8 @@ against. Upstream's own changelog continues below, unchanged.
 - Crate renamed to `sevenz-fast`; the Rust module paths and the public API stay
   upstream's, so a consumer's migration is `sevenz_rust2::` → `sevenz_fast::`.
 - Version starts at `0.23.0`, one minor above the upstream base, to make the
-  lineage obvious. The upstream `0.23.0 - Unreleased` entries below are part of
-  the fork base and ship with it.
+  lineage obvious. The `0.23.0` entries below were unreleased upstream at the fork
+  point; they are part of the fork base and ship with it.
 - MSRV raised from 1.93 to 1.97.1, which `lzma-fast` requires. Pinned in
   `rust-toolchain.toml`.
 - `Cargo.lock` is committed (upstream ignores it) so CI can run `--locked` and
@@ -335,7 +335,11 @@ Everything here is new surface; no upstream signature changed meaning.
   reading the binary fixtures `lzma-rust2` keeps in its repository, which are
   not ours to vendor.
 
-## 0.23.0 - Unreleased (upstream, inherited at the fork point)
+## 0.23.0 - 2026-09-17
+
+The first release of `sevenz-fast`. It is everything in the [Fork](#fork)
+section above, together with these upstream changes, which were unreleased at
+the fork point and ship here for the first time.
 
 ### Added
 
