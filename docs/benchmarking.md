@@ -148,6 +148,42 @@ in-flight runs will not fit in decodes single-threaded rather than failing.
 The upstream change that would remove the need to hold whole batches is the
 chase-decoder request in `docs/lzma-fast-requests.md`.
 
+#### AES-256: AWS-LC against RustCrypto
+
+Both cryptography backends decode the same archive, so the choice is a
+performance question. Two fixtures, both 1 GiB of incompressible payload
+written by `7zz a -pbench-passphrase`: `aes_store.7z` at `-mx0`, where AES (and
+the CRC) is nearly all of the work, and `aes_mx1.7z` at `-mx1`, where LZMA2
+dominates and AES is a few percent. Same box, same session, median of 3, the
+tool built twice — `cargo build --release -p decode-bench` for AWS-LC and
+`--features native-crypto` for RustCrypto — and run as
+`decode-bench --runs 3 --threads 1,8 --password …`.
+
+| Fixture | Lane | AWS-LC unpinned | RustCrypto unpinned | AWS-LC pinned | RustCrypto pinned |
+| --- | --- | --- | --- | --- | --- |
+| `aes_store.7z` (`-mx0`) | @1 | 1.197 s | 1.183 s | **0.928 s** | 1.055 s |
+| `aes_store.7z` (`-mx0`) | @8 | **1.206 s** | 1.317 s | **0.942 s** | 1.138 s |
+| `aes_mx1.7z` (`-mx1`) | @1 | 26.399 s | 27.195 s | 27.388 s | 25.848 s |
+| `aes_mx1.7z` (`-mx1`) | @8 | 21.514 s | 21.543 s | 21.938 s | 20.777 s |
+
+For reference on the AES-dominated fixture, `7zz t -p` is 0.814 s unpinned and
+0.619 s pinned, and upstream `sevenz-rust2` 0.22.2 (RustCrypto AES) is 1.153 s
+and 0.984 s. Every lane produced the same digest, `c337ec4e6fd27584`.
+
+AWS-LC is at least on par, and ahead where the measurement is cleanest: pinned
+to the performance cores it wins the AES-dominated fixture by 12% at one thread
+and 17% at eight. Unpinned at one thread the two are level (1.4% apart, inside
+the run-to-run spread of a hybrid box scheduling onto E-cores). On the `-mx1`
+fixture the differences are LZMA2 noise — AES is not the bottleneck there, and
+the two backends bracket each other in opposite directions between the pinned
+and unpinned runs, which is what "no signal" looks like.
+
+Two caveats on the store fixture: it is not pure AES — the `no crc` rows show
+CRC-32 is 0.05-0.2 s of it — and it is fast enough overall (around 1 s for
+1 GiB) that process start-up and page faults are a visible share. It separates
+the backends because it is the same work on both sides, not because it isolates
+the cipher.
+
 ### macOS arm64 (Apple M5 Max, 18 cores) — pending
 
 The single-threaded series on this machine is in the history of this file
