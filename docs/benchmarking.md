@@ -142,9 +142,13 @@ this fixture either.
 At the decoder's own boundary this crate matches that at every thread count —
 10.77 / 6.65 / 4.05 / 4.12 s at 2 / 4 / 8 / 16 threads, measured with
 `SEVENZ_FAST_MT_TRACE=1`, which is within ~2% of bare. The end-to-end lane
-above is ~0.7 s slower at eight threads: that is the copy out of the decoder's
-buffer into the caller's, plus the harness's own digest of 1 GiB. Removing the
-copy needs `drain_upto` from `docs/lzma-fast-requests.md`.
+above was ~0.7 s slower at eight threads when it was measured: the reader
+drained everything the decoder had ready, spilled what did not fit the
+caller's buffer, and copied it a second time on the way out. The reader now
+asks for no more than the caller's buffer holds (`drain_upto`, lzma-fast
+0.3.0), so what remains of the gap is the harness's own digest of 1 GiB. The
+table above predates that change; the x86-box rows have not been re-run
+since.
 
 #### What parallel decoding costs in memory
 

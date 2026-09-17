@@ -921,13 +921,19 @@ impl<R: Read> Read for Lzma2MtReader<R> {
 
             self.sync_threads();
 
-            // A `drain` decodes everything the bytes fed so far allow, so it
-            // can hand over far more than `buf` holds. What fits goes straight
-            // into the caller's buffer and only the rest is buffered here:
-            // output this reader copies twice is output it pays for twice.
+            // The decoder is asked for no more than `buf` holds, so what it
+            // hands over goes straight into the caller's buffer and the rest
+            // of the block it was in stays with the decoder for the next
+            // call. An unbounded `drain` decodes everything the bytes fed so
+            // far allow - at eight threads, up to a whole run per worker -
+            // and everything past `buf` had to be spilled here and copied a
+            // second time on the way out, which was measured at 0.7 s of a
+            // 4.8 s decode of a gigabyte. The spill path below is kept as
+            // the safety net for a sink handed more than it asked for; with
+            // `drain_upto` honouring its limit it is never taken.
             //
-            // `drain` borrows the decoder mutably and the sink needs the spill
-            // buffer, so the buffer is lent to the call and taken back.
+            // The call borrows the decoder mutably and the sink needs the
+            // spill buffer, so the buffer is lent to the call and taken back.
             let mut direct = 0usize;
             let t0 = std::time::Instant::now();
             let mut out = std::mem::take(&mut self.out);
@@ -936,7 +942,7 @@ impl<R: Read> Read for Lzma2MtReader<R> {
             let mut blocks = 0u64;
             let mut small = 0u64;
             let traced = self.trace.is_some();
-            let status = self.decoder.drain(|_offset, bytes| {
+            let status = self.decoder.drain_upto(buf.len(), |_offset, bytes| {
                 let ts = traced.then(std::time::Instant::now);
                 let mut rest = if direct < buf.len() {
                     let n = (buf.len() - direct).min(bytes.len());

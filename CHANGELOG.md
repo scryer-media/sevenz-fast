@@ -39,6 +39,11 @@ against. Upstream's own changelog continues below, unchanged.
   `lzma-rust2`. On the fixtures in `docs/benchmarking.md` this is 1.62x
   upstream's throughput and level with `7zz t -mmt=1`, where upstream was 1.3x
   behind it.
+- The parallel LZMA2 reader decodes no more than the caller's buffer holds
+  per read. It used to drain everything the decoder had ready — at eight
+  threads, up to a whole run per worker — spill the excess and copy it a
+  second time on the way out, which cost 0.7 s of a 4.8 s eight-thread decode
+  of a gigabyte on x86. Needs lzma-fast 0.3.0 for `drain_upto`.
 - `lzma-rust2` has left the library's runtime dependency graph. It remains an
   optional dependency behind the `compress` feature, which still uses its LZMA
   and LZMA2 *encoders*; with `--no-default-features` the graph is
