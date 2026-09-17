@@ -1,29 +1,29 @@
-# sevenz-fast
+# sevenz-turbo
 
-[![ci](https://github.com/scryer-media/sevenz-fast/actions/workflows/ci.yml/badge.svg)](https://github.com/scryer-media/sevenz-fast/actions/workflows/ci.yml)
-[![crates.io](https://img.shields.io/crates/v/sevenz-fast.svg)](https://crates.io/crates/sevenz-fast)
-[![docs.rs](https://docs.rs/sevenz-fast/badge.svg)](https://docs.rs/sevenz-fast)
+[![ci](https://github.com/scryer-media/sevenz-turbo/actions/workflows/ci.yml/badge.svg)](https://github.com/scryer-media/sevenz-turbo/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/sevenz-turbo.svg)](https://crates.io/crates/sevenz-turbo)
+[![docs.rs](https://docs.rs/sevenz-turbo/badge.svg)](https://docs.rs/sevenz-turbo)
 
 A 7z compressor/decompressor in pure Rust.
 
 ## This is a fork
 
-`sevenz-fast` is a fork of
+`sevenz-turbo` is a fork of
 **[sevenz-rust2](https://github.com/hasenbanck/sevenz-rust2)** by Nils
 Hasenbanck (Apache-2.0), taken at upstream `12ed7c8`, just after v0.22.2.
 Nearly all of the code here is upstream's, and it stays that way: the public
 API and the Rust module paths are upstream's, so migrating is
-`sevenz_rust2::` → `sevenz_fast::` plus whatever new calls you want.
+`sevenz_rust2::` → `sevenz_turbo::` plus whatever new calls you want.
 
 Two things differ, and they are the whole reason the fork exists.
 
-### 1. LZMA and LZMA2 decode with `lzma-fast`
+### 1. LZMA and LZMA2 decode with `lzma-turbo`
 
 Upstream decodes LZMA/LZMA2 with
 [`lzma-rust2`](https://github.com/hasenbanck/lzma-rust2), which is the fastest
 pure-Rust LZMA decoder published but still about 1.3x slower than 7-Zip
 single-threaded. This fork routes those two coders to
-[`lzma-fast`](https://github.com/scryer-media/lzma-fast), a port of Igor
+[`lzma-turbo`](https://github.com/scryer-media/lzma-turbo), a port of Igor
 Pavlov's reference decoder (including the LZMA SDK's assembly loops) that is at
 parity with `7zz` single-threaded. `lzma-rust2` is no longer in the library's
 runtime dependency graph; it remains only behind the `compress` feature, whose
@@ -75,7 +75,7 @@ Parallel decoding buys its speed with memory, and this crate spends more of it
 than the runs in flight alone would need: reading a long way ahead is what
 keeps the decoder from finishing a run on the delivering thread, which is worth
 about 1.5x at low thread counts and is explained in
-[docs/lzma-fast-requests.md](docs/lzma-fast-requests.md). Decoding a 900 MiB
+[docs/lzma-turbo-requests.md](docs/lzma-turbo-requests.md). Decoding a 900 MiB
 block peaks around 2.5 GiB. A caller who would rather have the memory than the
 speed says so with `ArchiveLimits::memory`, which bounds the read-ahead along
 with everything else; a caller who wants neither leaves the thread count at
@@ -104,7 +104,7 @@ to honour before it allocates, needs to ask the archive a few things first:
   two pieces joined, and `CrcFolder` folds a heap of `(offset, len, crc32)`
   pieces into any range they cover — for a consumer stitching across
   boundaries this crate does not know about, such as across blocks. Both are
-  re-exported from `lzma-fast`, so a consumer folds with the same
+  re-exported from `lzma-turbo`, so a consumer folds with the same
   implementation the decoder's workers checksummed with.
 
 ### Where the checksums come from
@@ -147,7 +147,7 @@ Because Cargo features are additive, `native-crypto` cannot mean "turn AWS-LC
 off"; it means "win when both are compiled". So `aes256` does not pull a
 backend in by itself: with `default-features = false` you pick one explicitly,
 and asking for `aes256` with neither is a compile error rather than a silent
-choice about what cryptography is in your binary. `sevenz_fast::crypto_backend()`
+choice about what cryptography is in your binary. `sevenz_turbo::crypto_backend()`
 reports which one a build selected.
 
 ## Speed
@@ -162,8 +162,8 @@ parallel; `st.7z` by `7zz -mmt=1`, so it cannot, by anyone.
 | `7zz t`, all threads | 3.86 s | 20.1 s |
 | `7zz t -mmt=1` | 20.2 s | 20.2 s |
 | `sevenz-rust2` 0.22.2 | 25.6 s | 28.7 s |
-| `sevenz-fast`, 1 thread | 19.9 s | 20.0 s |
-| `sevenz-fast`, 8 threads | 4.59 s | 20.0 s |
+| `sevenz-turbo`, 1 thread | 19.9 s | 20.0 s |
+| `sevenz-turbo`, 8 threads | 4.59 s | 20.0 s |
 
 On an Apple M5 Max the same `mt.7z` takes 2.28 s at 8 threads against
 2.13 s for `7zz`.
@@ -172,7 +172,7 @@ Encrypted archives are where the fork is clearly ahead. The same 1 GiB,
 stored (`-mx0`) and AES-256 encrypted, so that decrypting it is nearly all
 of the work:
 
-| `aes_store.7z` | `sevenz-fast` | `7zz t` | `sevenz-rust2` |
+| `aes_store.7z` | `sevenz-turbo` | `7zz t` | `sevenz-rust2` |
 | --- | --- | --- | --- |
 | Linux x86_64 | 0.28 s | 0.63 s | 0.94 s |
 | Windows x86_64 | 0.48 s | 0.65 s | 3.46 s |
@@ -188,19 +188,19 @@ What each phase of a decode costs, and the rest of the fixtures, are in
 
 ```toml
 [dependencies]
-sevenz-fast = "0.23"
+sevenz-turbo = "0.23"
 ```
 
 Decompress "data/sample.7z" to "data/sample":
 
 ```rust
-sevenz_fast::decompress_file("data/sample.7z", "data/sample").expect("complete");
+sevenz_turbo::decompress_file("data/sample.7z", "data/sample").expect("complete");
 ```
 
 ### Decompress an encrypted 7z file
 
 ```rust
-sevenz_fast::decompress_file_with_password("path/to/encrypted.7z", "data/sample", "password".into()).expect("complete");
+sevenz_turbo::decompress_file_with_password("path/to/encrypted.7z", "data/sample", "password".into()).expect("complete");
 ```
 
 ### Archives from strangers
@@ -212,7 +212,7 @@ defaults are in force whether or not a caller passes limits, and no archive a
 mainstream 7-Zip writes reaches them.
 
 ```rust
-use sevenz_fast::{ArchiveLimits, ArchiveReader, Password};
+use sevenz_turbo::{ArchiveLimits, ArchiveReader, Password};
 
 let limits = ArchiveLimits::memory(512 << 20)   // what a decode may allocate
     .with_max_unpack_bytes(8 << 30)             // refuse a bomb at open
@@ -231,13 +231,13 @@ default and rationale, and what happens when each is hit.
 ## Compression
 
 ```rust
-sevenz_fast::compress_to_path("examples/data/sample", "examples/data/sample.7z").expect("compress ok");
+sevenz_turbo::compress_to_path("examples/data/sample", "examples/data/sample.7z").expect("compress ok");
 ```
 
 ### Compress with AES encryption
 
 ```rust
-sevenz_fast::compress_to_path_encrypted("examples/data/sample", "examples/data/sample.7z", "password".into()).expect("compress ok");
+sevenz_turbo::compress_to_path_encrypted("examples/data/sample", "examples/data/sample.7z", "password".into()).expect("compress ok");
 ```
 
 ### Advanced usage
@@ -248,7 +248,7 @@ Solid archives can compress better, but decompressing one file needs all the
 data in front of it decompressed too.
 
 ```rust
-use sevenz_fast::*;
+use sevenz_turbo::*;
 
 let mut writer = ArchiveWriter::create("dest.7z").expect("create writer ok");
 writer.push_source_path("path/to/compress", |_| true).expect("pack ok");
@@ -258,7 +258,7 @@ writer.finish().expect("compress ok");
 #### Configure the compression methods
 
 ```rust
-use sevenz_fast::*;
+use sevenz_turbo::*;
 
 let mut writer = ArchiveWriter::create("dest.7z").expect("create writer ok");
 writer.set_content_methods(vec![
@@ -274,8 +274,8 @@ writer.finish().expect("compress ok");
 | Codec       | Decompression | Compression |
 |-------------|---------------|-------------|
 | COPY        | ✓            | ✓          |
-| LZMA        | ✓ (lzma-fast) | ✓          |
-| LZMA2       | ✓ (lzma-fast) | ✓          |
+| LZMA        | ✓ (lzma-turbo) | ✓          |
+| LZMA2       | ✓ (lzma-turbo) | ✓          |
 | BROTLI (*)  | ✓            | ✓          |
 | BZIP2       | ✓            | ✓          |
 | DEFLATE (*) | ✓            | ✓          |
@@ -326,7 +326,7 @@ named before the licence is.
   continued, and with it the first 7z implementation in pure Rust.
 - **Igor Pavlov** designed the 7z format, LZMA and LZMA2, and wrote
   [7-Zip](https://www.7-zip.org/), whose public-domain decoders are what
-  [`lzma-fast`](https://github.com/scryer-media/lzma-fast) ports and whose
+  [`lzma-turbo`](https://github.com/scryer-media/lzma-turbo) ports and whose
   `7zz` is the oracle every differential test in this crate is checked
   against.
 - Everyone in [CONTRIBUTORS.md](CONTRIBUTORS.md), which lists the upstream
@@ -338,8 +338,8 @@ This crate is licensed under the
 [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0),
 the same as upstream, and upstream's copyright notices are unchanged.
 
-Note that `lzma-fast`, which this crate depends on for LZMA/LZMA2 decoding, is
+Note that `lzma-turbo`, which this crate depends on for LZMA/LZMA2 decoding, is
 licensed GPL-3.0-or-later. This crate's own source stays Apache-2.0, but a
-binary that links it together with `lzma-fast` is a combined work under the
+binary that links it together with `lzma-turbo` is a combined work under the
 GPL. If that is a problem for you, upstream `sevenz-rust2` is the crate you
 want.

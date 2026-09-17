@@ -1,10 +1,10 @@
 //! This project is a 7z compressor/decompressor written in pure Rust.
 //!
-//! `sevenz-fast` is a fork of [sevenz-rust2](https://github.com/hasenbanck/sevenz-rust2)
+//! `sevenz-turbo` is a fork of [sevenz-rust2](https://github.com/hasenbanck/sevenz-rust2)
 //! (itself a fork of the unmaintained `sevenz-rust`). It differs from upstream
 //! in two ways, and the module paths and public API are otherwise upstream's:
 //!
-//! 1. LZMA and LZMA2 decode through [`lzma-fast`](https://github.com/scryer-media/lzma-fast),
+//! 1. LZMA and LZMA2 decode through [`lzma-turbo`](https://github.com/scryer-media/lzma-turbo),
 //!    a port of the 7-Zip reference decoder, instead of `lzma-rust2`.
 //! 2. It adds the container API a streaming consumer needs: memory limits
 //!    enforced before allocation, per-member CRCs, folder-to-pack-stream byte
@@ -92,7 +92,7 @@ use std::{
 
 pub use archive::*;
 pub use block::*;
-pub use codec::lzma_fast::{Lzma2Handle, Lzma2Progress};
+pub use codec::lzma_turbo::{Lzma2Handle, Lzma2Progress};
 pub use container::{
     ArchiveLimits, BlockCompletion, CrcFolder, PackStreamRange, SubStream, SubStreamCompletion,
     UnsizedCoder, coder_memory_estimate, crc32_combine,

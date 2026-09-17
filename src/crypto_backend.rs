@@ -1,10 +1,10 @@
 //! The one place that decides which implementation of SHA-256 the 7z `aes256`
 //! coder uses, and the crate's own AES-256-CBC.
 //!
-//! Two SHA-256 backends are available, both of them `lzma-fast`'s:
+//! Two SHA-256 backends are available, both of them `lzma-turbo`'s:
 //!
 //! - **`aws-lc-crypto`** (on by default) — `aws-lc-rs` over AWS-LC. It is the
-//!   scryer-media house default, shared with `lzma-fast` and `rarpar`, and it
+//!   scryer-media house default, shared with `lzma-turbo` and `rarpar`, and it
 //!   is what the numbers in `docs/benchmarking.md` were taken with.
 //! - **`native-crypto`** — RustCrypto's `sha2`, for consumers who cannot have
 //!   a C toolchain in their build.
@@ -22,7 +22,7 @@
 //!
 //! # AES-256-CBC is this crate's own, and it follows the same switch
 //!
-//! `lzma-fast` used to expose AES-256-CBC and the 7z key derivation; it
+//! `lzma-turbo` used to expose AES-256-CBC and the 7z key derivation; it
 //! dropped both on purpose, because 7z cryptography is this crate's job and
 //! that crate is LZMA, LZMA2 and the xz container. So the block cipher lives
 //! here — but it is *not* pinned to one implementation: it follows the same
@@ -56,9 +56,9 @@ use aws_lc_rs::cipher::{AES_256, DecryptingKey, DecryptionContext, UnboundCipher
 use aws_lc_rs::iv::FixedLength;
 
 #[cfg(all(feature = "aws-lc-crypto", not(feature = "native-crypto")))]
-pub(crate) use lzma_fast::crypto::awslc::Sha256;
+pub(crate) use lzma_turbo::crypto::awslc::Sha256;
 #[cfg(feature = "native-crypto")]
-pub(crate) use lzma_fast::crypto::rustcrypto::Sha256;
+pub(crate) use lzma_turbo::crypto::rustcrypto::Sha256;
 
 #[cfg(not(any(feature = "aws-lc-crypto", feature = "native-crypto")))]
 compile_error!(
@@ -219,7 +219,7 @@ pub(crate) type Aes256Cbc = RustCryptoAes256Cbc;
 pub(crate) type Aes256Cbc = AwsLcAes256Cbc;
 
 /// The shape both backends' SHA-256 share, so the key derivation can be
-/// written once and run against either one. `lzma-fast` exposes two concrete
+/// written once and run against either one. `lzma-turbo` exposes two concrete
 /// types rather than a trait, and a trait defined here can be implemented for
 /// both of them.
 pub(crate) trait Sha256Like: Sized {
@@ -248,9 +248,9 @@ macro_rules! impl_sha256_like {
 }
 
 #[cfg(feature = "aws-lc-crypto")]
-impl_sha256_like!(lzma_fast::crypto::awslc::Sha256);
+impl_sha256_like!(lzma_turbo::crypto::awslc::Sha256);
 #[cfg(feature = "native-crypto")]
-impl_sha256_like!(lzma_fast::crypto::rustcrypto::Sha256);
+impl_sha256_like!(lzma_turbo::crypto::rustcrypto::Sha256);
 
 #[cfg(test)]
 mod tests {
@@ -336,7 +336,7 @@ mod tests {
     /// including the two cycle counts `7zAes.c` treats specially.
     #[cfg(all(feature = "aws-lc-crypto", feature = "native-crypto"))]
     mod differential {
-        use lzma_fast::crypto::{awslc, rustcrypto};
+        use lzma_turbo::crypto::{awslc, rustcrypto};
 
         use crate::encryption::derive_key_with;
 

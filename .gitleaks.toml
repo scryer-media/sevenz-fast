@@ -1,4 +1,4 @@
-title = "sevenz-fast gitleaks config"
+title = "sevenz-turbo gitleaks config"
 
 [allowlist]
 description = "allow obvious examples and test placeholders"

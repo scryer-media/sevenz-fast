@@ -6,9 +6,9 @@ use std::{
 };
 
 #[cfg(all(feature = "compress", feature = "util"))]
-use sevenz_fast::encoder_options::*;
+use sevenz_turbo::encoder_options::*;
 #[cfg(all(feature = "compress", feature = "util"))]
-use sevenz_fast::*;
+use sevenz_turbo::*;
 #[cfg(all(feature = "compress", feature = "util"))]
 use tempfile::*;
 
@@ -428,7 +428,7 @@ fn anti_item_roundtrip() {
 fn encrypted_file_header_requires_password_to_read() {
     use std::io::Cursor;
 
-    use sevenz_fast::{
+    use sevenz_turbo::{
         Archive, ArchiveEntry, ArchiveWriter, Password,
         encoder_options::{AesEncoderOptions, Lzma2Options},
     };

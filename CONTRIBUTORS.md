@@ -1,6 +1,6 @@
 # Contributors
 
-`sevenz-fast` is a fork. Most of the code in this repository was written by
+`sevenz-turbo` is a fork. Most of the code in this repository was written by
 other people, and the copyright and the Apache-2.0 licence of the upstream
 project carry over unchanged.
 
@@ -18,5 +18,5 @@ Hasenbanck, also Apache-2.0.
 - NZB Man (maintainer)
 
 The LZMA/LZMA2 decoding this fork exists to use lives in
-[`lzma-fast`](https://github.com/scryer-media/lzma-fast), a port of Igor
+[`lzma-turbo`](https://github.com/scryer-media/lzma-turbo), a port of Igor
 Pavlov's public-domain LZMA SDK.

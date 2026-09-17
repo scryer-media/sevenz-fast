@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Fork
 
-`sevenz-fast` is a fork of [sevenz-rust2](https://github.com/hasenbanck/sevenz-rust2)
+`sevenz-turbo` is a fork of [sevenz-rust2](https://github.com/hasenbanck/sevenz-rust2)
 taken at upstream `12ed7c8` (post-v0.22.2). This section is the exhaustive list
 of how it differs from that commit, and it is the checklist a rebase is checked
 against. Upstream's own changelog continues below, unchanged.
@@ -19,12 +19,15 @@ against. Upstream's own changelog continues below, unchanged.
   `docs/publishing.md`. The crate archive no longer carries the repository's
   CI, hook and agent files.
 
-- Crate renamed to `sevenz-fast`; the Rust module paths and the public API stay
-  upstream's, so a consumer's migration is `sevenz_rust2::` → `sevenz_fast::`.
+- The fork was briefly on crates.io as `sevenz-fast`, with the same contents as
+  0.23.0; that name is withdrawn, along with `lzma-fast` for
+  `lzma-turbo`.
+- Crate renamed to `sevenz-turbo`; the Rust module paths and the public API stay
+  upstream's, so a consumer's migration is `sevenz_rust2::` → `sevenz_turbo::`.
 - Version starts at `0.23.0`, one minor above the upstream base, to make the
   lineage obvious. The `0.23.0` entries below were unreleased upstream at the fork
   point; they are part of the fork base and ship with it.
-- MSRV raised from 1.93 to 1.97.1, which `lzma-fast` requires. Pinned in
+- MSRV raised from 1.93 to 1.97.1, which `lzma-turbo` requires. Pinned in
   `rust-toolchain.toml`.
 - `Cargo.lock` is committed (upstream ignores it) so CI can run `--locked` and
   `cargo audit` has something to audit.
@@ -34,13 +37,13 @@ against. Upstream's own changelog continues below, unchanged.
   hooks, renovate, issue templates, `AGENTS.md`, `SECURITY.md`,
   `CONTRIBUTORS.md`. Upstream's `.github/workflows/rust.yml` and
   `.github/dependabot.yml` were removed as duplicates of these.
-- The `lzma-fast` dependency is a path dependency for now. It becomes a
+- The `lzma-turbo` dependency is a path dependency for now. It becomes a
   crates.io version pin before this crate is published.
 
 ### Decoding
 
 - LZMA (`0x030101`) and LZMA2 (`0x21`) are decoded by
-  [`lzma-fast`](https://github.com/scryer-media/lzma-fast) instead of
+  [`lzma-turbo`](https://github.com/scryer-media/lzma-turbo) instead of
   `lzma-rust2`. On the fixtures in `docs/benchmarking.md` this is 1.62x
   upstream's throughput and level with `7zz t -mmt=1`, where upstream was 1.3x
   behind it.
@@ -48,21 +51,21 @@ against. Upstream's own changelog continues below, unchanged.
   per read. It used to drain everything the decoder had ready — at eight
   threads, up to a whole run per worker — spill the excess and copy it a
   second time on the way out. Measured on x86 at eight threads, a gigabyte
-  went from 4.82 s to 4.59 s. Needs lzma-fast 0.3.0 for `drain_upto`.
+  went from 4.82 s to 4.59 s. Needs lzma-turbo 0.3.0 for `drain_upto`.
 - `lzma-rust2` has left the library's runtime dependency graph. It remains an
   optional dependency behind the `compress` feature, which still uses its LZMA
   and LZMA2 *encoders*; with `--no-default-features` the graph is
-  `sevenz-fast → lzma-fast → crc-fast` and nothing else.
+  `sevenz-turbo → lzma-turbo → crc-fast` and nothing else.
 - The BCJ, BCJ2 and delta filters are vendored into `src/codec/filter/` from
   `lzma-rust2` 0.20.1 (Apache-2.0, same licence), which is what lets
   `lzma-rust2` leave the decode graph rather than be carried for three filters.
   `src/codec/filter/mod.rs` documents the provenance and the mechanical
   changes.
-- LZMA2 decodes on several threads through `lzma-fast`'s `Lzma2AdaptiveDecoder`
+- LZMA2 decodes on several threads through `lzma-turbo`'s `Lzma2AdaptiveDecoder`
   — a stream is cut at the dictionary resets that make a *run* independently
   decodable, and runs are decoded on workers while output stays in order.
   Upstream's `Decoder::Lzma2Mt` (`lzma-rust2`'s `Lzma2ReaderMt`) is gone;
-  `Lzma2Plan` in `src/codec/lzma_fast.rs` is the one place that chooses, and
+  `Lzma2Plan` in `src/codec/lzma_turbo.rs` is the one place that chooses, and
   the rest of the decode chain, the CRC verification and the completion hook
   are unchanged by the choice.
 - **The thread count now defaults to one**, where upstream defaults to
@@ -98,7 +101,7 @@ against. Upstream's own changelog continues below, unchanged.
   parallel decoder at two threads; feeding whole runs a gigabyte at a time is
   within 2% of it at every thread count measured. `docs/benchmarking.md` has
   the numbers and the memory that buys them, and
-  `docs/lzma-fast-requests.md` the upstream change that would make the
+  `docs/lzma-turbo-requests.md` the upstream change that would make the
   gigabyte unnecessary.
 - And when a good look at a stream has found no run boundary at all — what
   `7zz -mmt=1` writes is one run from beginning to end — the reader stops
@@ -114,7 +117,7 @@ against. Upstream's own changelog continues below, unchanged.
 - LZMA1 is now subject to the same dictionary memory limit as LZMA2. Upstream
   bounded only LZMA2, so an archive declaring a 4 GiB LZMA1 dictionary would
   try to allocate it.
-- CRC-32 comes from `crc-fast` (via `lzma-fast`) rather than `crc32fast`; the
+- CRC-32 comes from `crc-fast` (via `lzma-turbo`) rather than `crc32fast`; the
   `crc32fast` dependency is gone.
 - The LZMA coder's properties are length-checked before being sliced, instead
   of panicking on a short field.
@@ -233,7 +236,7 @@ Everything here is new surface; no upstream signature changed meaning.
   twice. On by default. With it off a corrupt archive decodes into corrupt
   bytes without complaint, which is why it is spelled out rather than implied
   by a thread count or a limit.
-- `crc32_combine(a, b, len_b)` and `CrcFolder`, re-exported from `lzma-fast`:
+- `crc32_combine(a, b, len_b)` and `CrcFolder`, re-exported from `lzma-turbo`:
   the checksum of two pieces joined, and a heap of `(offset, len, crc32)`
   pieces folded into any range they cover, for a consumer folding across
   boundaries this crate does not know about, such as across blocks. Re-exported
@@ -249,8 +252,8 @@ Everything here is new surface; no upstream signature changed meaning.
 ### Documentation
 
 - `docs/benchmarking.md` — the harness, the acceptance gate and the numbers.
-- `docs/lzma-fast-requests.md` — the API this crate would like from
-  `lzma-fast`, with the exact signatures and the local work-around for each.
+- `docs/lzma-turbo-requests.md` — the API this crate would like from
+  `lzma-turbo`, with the exact signatures and the local work-around for each.
   The parallel-decoder request landed and is recorded as such; the AES and
   key-derivation requests were withdrawn when that crate removed both on
   purpose; what is outstanding is worker-side checksums on the adaptive
@@ -276,13 +279,13 @@ Everything here is new surface; no upstream signature changed meaning.
 
 - Cryptography for the `aes256` coder — SHA-256 *and* AES-256-CBC — goes
   through one internal backend module, `src/crypto_backend.rs`. SHA-256 comes
-  from `lzma-fast`'s crypto module. The default backend is
+  from `lzma-turbo`'s crypto module. The default backend is
   `aws-lc-rs` (feature `aws-lc-crypto`, in `default`), the scryer-media house
-  convention shared with `lzma-fast` and `rarpar`; `native-crypto` selects
+  convention shared with `lzma-turbo` and `rarpar`; `native-crypto` selects
   RustCrypto's `sha2` and **takes precedence** when both are compiled, so a
   consumer who cannot build C uses `default-features = false` plus
   `native-crypto`.
-- **AES-256-CBC is this crate's own code, but not its own backend.** `lzma-fast`
+- **AES-256-CBC is this crate's own code, but not its own backend.** `lzma-turbo`
   removed AES and the 7z key derivation deliberately — 7z cryptography is this
   crate's job — so the cipher lives in `src/crypto_backend.rs`, and it follows
   the same feature switch SHA-256 does: `aws_lc_rs::cipher::DecryptingKey::cbc`
@@ -294,12 +297,12 @@ Everything here is new surface; no upstream signature changed meaning.
   block, copied out before the in-place decrypt, is the next chunk's IV. The
   encoder (`compress`) keeps RustCrypto's `cbc::Encryptor`.
   `aws-lc-rs` is a direct optional dependency on the pin and features
-  `lzma-fast` uses, so a build with both crates resolves one copy of AWS-LC.
+  `lzma-turbo` uses, so a build with both crates resolves one copy of AWS-LC.
 - `aes256` no longer implies a backend: enabling it with neither
   `aws-lc-crypto` nor `native-crypto` is a compile error. A consumer migrating
   from upstream with `default-features = false, features = ["aes256", …]` adds
   `"aws-lc-crypto"` to that list.
-- New `sevenz_fast::crypto_backend() -> &'static str`, reporting which backend
+- New `sevenz_turbo::crypto_backend() -> &'static str`, reporting which backend
   a build selected, for consumers who want to assert on it.
 - The `aes` and `cbc` dependencies are enabled by `native-crypto` (decryption)
   and by `compress` (encryption); the AWS-LC lane does not compile them. The
@@ -335,9 +338,14 @@ Everything here is new surface; no upstream signature changed meaning.
   reading the binary fixtures `lzma-rust2` keeps in its repository, which are
   not ours to vendor.
 
+## 0.23.1 - 2026-09-17
+
+The first release under the name `sevenz-turbo`, on `lzma-turbo` 0.3.1. The code
+is 0.23.0's; only the crate names changed.
+
 ## 0.23.0 - 2026-09-17
 
-The first release of `sevenz-fast`. It is everything in the [Fork](#fork)
+The first release of the fork. It is everything in the [Fork](#fork)
 section above, together with these upstream changes, which were unreleased at
 the fork point and ship here for the first time.
 
@@ -352,7 +360,7 @@ the fork point and ship here for the first time.
   compression workers, avoiding capacity-overflow panics.
 - Improved decompression performance for non-solid 7z archives containing many files.
 - Threaded LZMA2 decoding of archives made of many small runs - what `7zz -mx1` writes for data that does not
-  compress, 1 MiB a run - scales with the thread count. It took two changes: `lzma-fast` 0.3.0 no longer moves its
+  compress, 1 MiB a run - scales with the thread count. It took two changes: `lzma-turbo` 0.3.0 no longer moves its
   whole input buffer after every run, and the reader here stops reading ahead once there are two runs per thread
   waiting and tops that up before every drain, instead of reading a gigabyte before the first worker started. A 1 GiB
   archive of that shape at 18 threads: 4.6 s before, 1.1 s after, level with `7zz t`.

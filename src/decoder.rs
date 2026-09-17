@@ -5,7 +5,7 @@ use std::sync::Arc;
 use bzip2::read::BzDecoder;
 #[cfg(feature = "deflate")]
 use flate2::bufread::DeflateDecoder;
-use lzma_fast::LzmaReader;
+use lzma_turbo::LzmaReader;
 #[cfg(feature = "ppmd")]
 use ppmd_rust::{
     PPMD7_MAX_MEM_SIZE, PPMD7_MAX_ORDER, PPMD7_MIN_MEM_SIZE, PPMD7_MIN_ORDER, Ppmd7Decoder,
@@ -17,7 +17,7 @@ use crate::codec::brotli::BrotliDecoder;
 use crate::codec::lz4::Lz4Decoder;
 use crate::codec::{
     filter::{bcj::BcjReader, delta::DeltaReader},
-    lzma_fast::{
+    lzma_turbo::{
         Lzma2Coder, Lzma2Control, Lzma2Plan, lzma2_clamped_prop, lzma2_decoder,
         lzma2_dictionary_size, lzma2_memory_usage_kb,
     },
@@ -159,8 +159,8 @@ pub fn add_decoder<I: Read>(
             }
             // Clamp before the budget check, so a coder that declares a huge
             // dictionary for a small stream is decoded rather than refused.
-            let dict_size = crate::codec::lzma_fast::clamp_dictionary(
-                crate::codec::lzma_fast::lzma_dictionary_size(&coder.properties)?,
+            let dict_size = crate::codec::lzma_turbo::clamp_dictionary(
+                crate::codec::lzma_turbo::lzma_dictionary_size(&coder.properties)?,
                 uncompressed_len as u64,
             );
             let mem_size = lzma2_memory_usage_kb(dict_size);
@@ -170,7 +170,7 @@ pub fn add_decoder<I: Read>(
                     actaul_kb: mem_size,
                 });
             }
-            let lz = crate::codec::lzma_fast::lzma_decoder(
+            let lz = crate::codec::lzma_turbo::lzma_decoder(
                 input,
                 uncompressed_len,
                 &coder.properties,

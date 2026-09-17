@@ -1,6 +1,6 @@
 use std::io::Read;
 
-use lzma_fast::crc::Crc32;
+use lzma_turbo::crc::Crc32;
 
 /// A wrapper around a reader that tracks read count and CRC32.
 ///

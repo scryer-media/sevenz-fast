@@ -3,7 +3,7 @@ use std::{
     sync::Arc,
 };
 
-use sevenz_fast::{Archive, BlockDecoder, Password};
+use sevenz_turbo::{Archive, BlockDecoder, Password};
 
 /// Joins an untrusted archive entry name onto `dest`, rejecting any path that would escape
 /// the destination directory (Zip-Slip / CWE-22). Always route `entry.name()` through a
@@ -65,7 +65,7 @@ fn main() {
                 .for_each_entries(&mut |entry, reader| {
                     // `safe_join` rejects any entry name that would escape `dest`.
                     let dest = safe_join(&dest, entry.name())?;
-                    sevenz_fast::default_entry_extract_fn(entry, reader, &dest)?;
+                    sevenz_turbo::default_entry_extract_fn(entry, reader, &dest)?;
                     Ok(true)
                 })
                 .expect("ok");

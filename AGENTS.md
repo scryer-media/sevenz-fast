@@ -1,15 +1,15 @@
-# Agent and contributor rules for sevenz-fast
+# Agent and contributor rules for sevenz-turbo
 
 These rules apply to every automated agent and every human contributor.
 
 ## What this repository is
 
-`sevenz-fast` is a fork of [sevenz-rust2](https://github.com/hasenbanck/sevenz-rust2)
+`sevenz-turbo` is a fork of [sevenz-rust2](https://github.com/hasenbanck/sevenz-rust2)
 by hasenbanck, Apache-2.0, forked at upstream `12ed7c8` (post-v0.22.2). It
 exists for two reasons and no others:
 
 1. **Codec swap.** LZMA (`03 01 01`) and LZMA2 (`21`) decode through
-   [`lzma-fast`](https://github.com/scryer-media/lzma-fast), a port of Igor
+   [`lzma-turbo`](https://github.com/scryer-media/lzma-turbo), a port of Igor
    Pavlov's reference decoder, instead of `lzma-rust2`. `lzma-rust2` is not in
    the library's runtime dependency graph; it remains only behind the
    `compress` feature, whose encoders upstream needs for writing archives.
@@ -21,7 +21,7 @@ exists for two reasons and no others:
 
 Everything else should stay byte-for-byte upstream so that rebases are
 mechanical. **Rust module paths and the public API are upstream's**, so a
-consumer's migration is `sevenz_rust2::` → `sevenz_fast::` plus the new calls.
+consumer's migration is `sevenz_rust2::` → `sevenz_turbo::` plus the new calls.
 
 ## Fork rules
 
@@ -56,10 +56,10 @@ differential matrix in `docs/benchmarking.md`.
 
 ## Codec rules
 
-- LZMA and LZMA2 decoding is `lzma-fast`'s, reached only through
-  `src/codec/lzma_fast.rs`. Nothing else in the crate names `lzma_fast::`.
+- LZMA and LZMA2 decoding is `lzma-turbo`'s, reached only through
+  `src/codec/lzma_turbo.rs`. Nothing else in the crate names `lzma_turbo::`.
   That file is also where the multi-threaded LZMA2 coder lives; see
-  `docs/lzma-fast-requests.md`.
+  `docs/lzma-turbo-requests.md`.
 - The BCJ, BCJ2 and delta filters are vendored from `lzma-rust2` (Apache-2.0,
   see `src/codec/filter/mod.rs`) so the crate does not carry `lzma-rust2` at
   runtime. Fixes to them belong upstream in `lzma-rust2` as well as here.
@@ -67,7 +67,7 @@ differential matrix in `docs/benchmarking.md`.
   `aws-lc-rs` by default, RustCrypto when the `native-crypto` feature is on.
   Never call a backend crate directly from anywhere else. The one exception is
   the encoder's `cbc::Encryptor` in `src/encryption/aes.rs`, behind `compress`.
-- CRC-32 is `crc-fast` (via `lzma-fast`'s `crc` module), never `crc32fast`.
+- CRC-32 is `crc-fast` (via `lzma-turbo`'s `crc` module), never `crc32fast`.
 - **No CRC-32 is computed in a serialised section of the multi-threaded path.**
   Checksumming is O(bytes) and the in-order section is the one place where the
   core count does not help, so a checksum taken there is a tax that grows with
@@ -96,7 +96,7 @@ differential matrix in `docs/benchmarking.md`.
   either cost 1.5x against a bare parallel decode at two threads. Anything
   changing `pump_input` or the feed constants must be measured at 2, 4 and 8
   threads, not only at the machine's full width, where the whole archive fits
-  one batch and the bug is invisible. `SEVENZ_FAST_MT_TRACE=1` prints the phase
+  one batch and the bug is invisible. `SEVENZ_TURBO_MT_TRACE=1` prints the phase
   split — how much was chased, how long was spent feeding, how long draining —
   and is how that is checked.
 

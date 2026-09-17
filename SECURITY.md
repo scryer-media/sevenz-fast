@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-Only the latest published release of `sevenz-fast` receives fixes.
+Only the latest published release of `sevenz-turbo` receives fixes.
 
 ## Reporting a vulnerability
 

@@ -295,8 +295,8 @@ name = "decode-bench"
 version = "0.0.0"
 dependencies = [
  "aws-lc-rs",
- "sevenz-fast",
  "sevenz-rust2",
+ "sevenz-turbo",
 ]
 
 [[package]]
@@ -571,21 +571,21 @@ dependencies = [
 ]
 
 [[package]]
-name = "lzma-fast"
-version = "0.3.0"
+name = "lzma-rust2"
+version = "0.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2df0054110ace19920f0b9ce16915895400133fa27fadebfd31eba0b529cfaa"
+checksum = "5e2a88783b84d2d67ef2791778a9e76bfb68b8017aaf6c9d7d5f2626a478b16c"
+
+[[package]]
+name = "lzma-turbo"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bb9ddb5508e387c70d89bb5c3014d8f1240bc0a766a5ced923a629ef8ca2573e"
 dependencies = [
  "aws-lc-rs",
  "crc-fast",
  "sha2",
 ]
-
-[[package]]
-name = "lzma-rust2"
-version = "0.20.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e2a88783b84d2d67ef2791778a9e76bfb68b8017aaf6c9d7d5f2626a478b16c"
 
 [[package]]
 name = "miniz_oxide"
@@ -751,29 +751,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sevenz-fast"
-version = "0.23.0"
-dependencies = [
- "aes",
- "aws-lc-rs",
- "brotli 9.0.0",
- "bzip2",
- "cbc",
- "flate2",
- "getrandom",
- "js-sys",
- "lz4_flex",
- "lzma-fast",
- "lzma-rust2",
- "nt-time",
- "ppmd-rust",
- "rand",
- "tempfile",
- "wasm-bindgen",
- "zstd 0.14.0",
-]
-
-[[package]]
 name = "sevenz-rust2"
 version = "0.22.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -793,6 +770,29 @@ dependencies = [
  "sha2",
  "wasm-bindgen",
  "zstd 0.13.3",
+]
+
+[[package]]
+name = "sevenz-turbo"
+version = "0.23.1"
+dependencies = [
+ "aes",
+ "aws-lc-rs",
+ "brotli 9.0.0",
+ "bzip2",
+ "cbc",
+ "flate2",
+ "getrandom",
+ "js-sys",
+ "lz4_flex",
+ "lzma-rust2",
+ "lzma-turbo",
+ "nt-time",
+ "ppmd-rust",
+ "rand",
+ "tempfile",
+ "wasm-bindgen",
+ "zstd 0.14.0",
 ]
 
 [[package]]

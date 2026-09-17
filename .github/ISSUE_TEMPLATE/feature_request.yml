@@ -14,7 +14,7 @@ body:
       label: Scope check
       description: >
         This is a fork of sevenz-rust2 that exists to decode LZMA/LZMA2 with
-        lzma-fast and to expose the container detail a streaming consumer needs.
+        lzma-turbo and to expose the container detail a streaming consumer needs.
         A request that is not about either is usually better filed upstream at
         https://github.com/hasenbanck/sevenz-rust2 — say why it belongs here.
     validations:

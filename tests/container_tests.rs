@@ -11,8 +11,8 @@ use std::cell::RefCell;
 use std::io::{Cursor, Read};
 use std::rc::Rc;
 
-use sevenz_fast::encoder_options::{EncoderOptions, Lzma2Options};
-use sevenz_fast::{
+use sevenz_turbo::encoder_options::{EncoderOptions, Lzma2Options};
+use sevenz_turbo::{
     Archive, ArchiveEntry, ArchiveLimits, ArchiveReader, ArchiveWriter, BlockCompletion,
     EncoderConfiguration, EncoderMethod, Error, Password, SourceReader,
 };

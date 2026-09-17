@@ -1,6 +1,6 @@
-# API requests to `lzma-fast`
+# API requests to `lzma-turbo`
 
-This fork consumes [`lzma-fast`](https://github.com/scryer-media/lzma-fast) and
+This fork consumes [`lzma-turbo`](https://github.com/scryer-media/lzma-turbo) and
 does not modify it. Where a different signature there would let this crate do
 something it currently cannot, the request is written here, with the exact
 shape that is wanted and what it is for, so the two crates can move
@@ -13,7 +13,7 @@ work-around is named per item.
 
 ### The parallel LZMA2 decoder — landed, and this fork is on it
 
-The request that mattered. `lzma-fast` now has two multi-threaded drivers, and
+The request that mattered. `lzma-turbo` now has two multi-threaded drivers, and
 this crate uses the second one:
 
 ```rust
@@ -62,12 +62,12 @@ neither. The adaptive decoder borrows nothing — the work it hands to threads i
 owned copies of complete runs — and it is the only one of the two that can
 change its thread count mid-stream, which is what a consumer chasing a download
 needs. Both find runs with the same scanner and decode them with the same
-decoder, so the bytes are identical. See `src/codec/lzma_fast.rs`.
+decoder, so the bytes are identical. See `src/codec/lzma_turbo.rs`.
 
 ### AES-256-CBC and the 7z key derivation — withdrawn
 
 This file used to ask for an AES *encryptor* and for the 7z key derivation on a
-caller-chosen backend. `lzma-fast` has since removed AES and that derivation
+caller-chosen backend. `lzma-turbo` has since removed AES and that derivation
 altogether, deliberately: 7z cryptography is this crate's job, and that crate is
 LZMA, LZMA2 and the xz container. Both requests are therefore withdrawn, not
 outstanding.
@@ -76,7 +76,7 @@ What this crate does instead, in `src/crypto_backend.rs`: AES-256-CBC is
 written here and follows the same backend feature SHA-256 does —
 `aws_lc_rs::cipher::DecryptingKey::cbc` (AWS-LC's unpadded CBC mode) by
 default, RustCrypto's `aes`/`cbc` under `native-crypto` — while SHA-256 comes
-from `lzma_fast::crypto::awslc` or `lzma_fast::crypto::rustcrypto`. Neither
+from `lzma_turbo::crypto::awslc` or `lzma_turbo::crypto::rustcrypto`. Neither
 lane needs a streaming CBC API: each chunk is decrypted with the current IV and
 its last ciphertext block becomes the next chunk's. The 7z derivation runs over
 a local `Sha256Like` trait, and the cipher over an `Aes256CbcLike` one, which
@@ -133,7 +133,7 @@ pending:
 
 ### A drain that stops when the caller's buffer is full — landed, and this fork is on it
 
-`Lzma2AdaptiveDecoder::drain_upto(limit, sink)` (lzma-fast 0.3.0) hands the
+`Lzma2AdaptiveDecoder::drain_upto(limit, sink)` (lzma-turbo 0.3.0) hands the
 sink no more than `limit` bytes and keeps the rest of the block for the next
 call. The parallel reader here asks for exactly what the caller's buffer
 holds, so a block out of the parallel path — a whole run, 128 MiB for an
@@ -144,7 +144,7 @@ never taken.
 
 ### A chase decoder that stands aside while a worker is free — landed, not yet taken up
 
-`Lzma2AdaptiveDecoder::set_chase(false)` (lzma-fast 0.3.0) makes the
+`Lzma2AdaptiveDecoder::set_chase(false)` (lzma-turbo 0.3.0) makes the
 decoder wait for a worker instead of decoding the run at its cursor on the
 calling thread when that run's chunk header has not arrived. That was the
 request: for a stream already on disk, chasing happened once per batch of fed

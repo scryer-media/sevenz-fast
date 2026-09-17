@@ -16,7 +16,7 @@ use std::{
 use std::{fs::File, path::Path};
 
 pub(crate) use counting_writer::CountingWriter;
-use lzma_fast::crc::{Crc32, crc32 as crc32_of};
+use lzma_turbo::crc::{Crc32, crc32 as crc32_of};
 
 #[cfg(all(feature = "util", not(target_arch = "wasm32")))]
 pub(crate) use self::lazy_file_reader::LazyFileReader;
@@ -150,7 +150,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
     /// ```no_run
     /// use std::{fs::File, path::Path};
     ///
-    /// use sevenz_fast::*;
+    /// use sevenz_turbo::*;
     /// let mut sz = ArchiveWriter::create("path/to/dest.7z").expect("create writer ok");
     /// let src = Path::new("path/to/source.txt");
     /// let name = "source.txt".to_string();

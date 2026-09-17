@@ -2,7 +2,7 @@
 
 use std::io::{Cursor, ErrorKind};
 
-use sevenz_fast::{
+use sevenz_turbo::{
     ArchiveEntry, ArchiveWriter, EncoderConfiguration, Error,
     encoder_options::{Lzma2Options, LzmaOptions},
 };

@@ -8,12 +8,12 @@ use std::{env, process::ExitCode};
 use crate::cmd::{capture, capture_all, cargo, read, repo_root, run, succeeds};
 
 /// The crate this repository publishes.
-const CRATE: &str = "sevenz-fast";
+const CRATE: &str = "sevenz-turbo";
 const CHANGELOG: &str = "CHANGELOG.md";
 const README: &str = "README.md";
 /// Dependencies developed in a sibling checkout. A released manifest must
 /// reach them through crates.io alone, because CI has no sibling checkout.
-const SIBLING_DEPS: &[&str] = &["lzma-fast"];
+const SIBLING_DEPS: &[&str] = &["lzma-turbo"];
 
 const USAGE: &str = "\
 cargo xtask release [--dry-run] [--publish] [--skip-tests]

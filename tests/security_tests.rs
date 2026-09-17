@@ -4,7 +4,7 @@
 
 use std::io::Cursor;
 
-use sevenz_fast::{
+use sevenz_turbo::{
     ArchiveEntry, ArchiveLimits, ArchiveReader, ArchiveWriter, Error, Limit, Password, decompress,
 };
 use tempfile::tempdir;
@@ -52,7 +52,7 @@ const SEVEN_Z_SIGNATURE: [u8; 6] = [0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C];
 /// CRC-32/ISO-HDLC over the start/next headers, reusing the crate's own `crc-fast`
 /// dependency (available to integration tests) so the crafted archives pass verification.
 fn crc32(data: &[u8]) -> u32 {
-    lzma_fast::crc::crc32(data)
+    lzma_turbo::crc::crc32(data)
 }
 
 // 7z structure IDs used by the crafted headers.
@@ -331,7 +331,7 @@ fn more_substreams_than_files_is_rejected() {
 /// The payload is longer than 256 bytes so the distance genuinely affects the transform.
 #[test]
 fn delta_distance_256_round_trips() {
-    use sevenz_fast::encoder_options::DeltaOptions;
+    use sevenz_turbo::encoder_options::DeltaOptions;
 
     let original: Vec<u8> = (0..1024u32).map(|i| i.wrapping_mul(31) as u8).collect();
 
@@ -609,7 +609,7 @@ impl<R: std::io::Seek> std::io::Seek for DripReader<R> {
 #[cfg(feature = "aes256")]
 #[test]
 fn aes_decode_survives_one_byte_reads() {
-    use sevenz_fast::encoder_options::AesEncoderOptions;
+    use sevenz_turbo::encoder_options::AesEncoderOptions;
 
     let original: Vec<u8> = (0..200u32).map(|i| i as u8).collect();
 

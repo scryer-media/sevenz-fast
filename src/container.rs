@@ -353,7 +353,7 @@ pub struct SubStreamCompletion {
 /// for a consumer folding across boundaries this crate does not know about,
 /// so that it does so with the same implementation the workers checksummed
 /// with rather than a second copy of it.
-pub use lzma_fast::crc::crc32_combine;
+pub use lzma_turbo::crc::crc32_combine;
 
 /// Folds checksummed pieces into the checksum of any range they cover.
 ///
@@ -361,7 +361,7 @@ pub use lzma_fast::crc::crc32_combine;
 /// [`crc32_combine`]; a range is answered only when the pieces cover it
 /// exactly. Use it to fold across blocks, or across whatever boundaries a
 /// consumer has that a 7z archive does not.
-pub use lzma_fast::crc::CrcFolder;
+pub use lzma_turbo::crc::CrcFolder;
 
 // ---------------------------------------------------------------------------
 // Decoder memory model

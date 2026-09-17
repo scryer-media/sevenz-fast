@@ -5,7 +5,7 @@
 //! These files are copied from [`lzma-rust2`] 0.20.1 (`src/filter/`) by Nils
 //! Hasenbanck, Apache-2.0, the same licence as this crate. Upstream
 //! `sevenz-rust2` reaches them through the `lzma-rust2` dependency; this fork
-//! decodes LZMA and LZMA2 with `lzma-fast` instead, and vendoring the filters
+//! decodes LZMA and LZMA2 with `lzma-turbo` instead, and vendoring the filters
 //! is what lets `lzma-rust2` leave the runtime dependency graph entirely
 //! rather than being carried for three filters.
 //!

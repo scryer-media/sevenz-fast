@@ -8,7 +8,7 @@ use crate::ByteWriter;
 /// You can convert strings easily into password using the Into/From traits:
 ///
 /// ```rust
-/// use sevenz_fast::Password;
+/// use sevenz_turbo::Password;
 ///
 /// let password: Password = "a password string".into();
 /// ```

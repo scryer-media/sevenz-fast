@@ -4,7 +4,7 @@
 # the crate, and it must not pull the real workspace's members (the bench tool,
 # its oracles) into that.
 [package]
-name = "sevenz-fast-fuzz"
+name = "sevenz-turbo-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2024"
@@ -17,7 +17,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 
-[dependencies.sevenz-fast]
+[dependencies.sevenz-turbo]
 path = ".."
 
 [profile.release]

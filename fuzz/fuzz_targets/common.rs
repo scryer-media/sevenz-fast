@@ -78,8 +78,8 @@ pub fn wrap(next_header: &[u8]) -> Vec<u8> {
 /// What a consumer of untrusted archives sets: the structural defaults, plus a
 /// budget, because a dictionary is sized by the header too and the default
 /// budget is "whatever the caller can afford".
-pub fn limits() -> sevenz_fast::ArchiveLimits {
-    sevenz_fast::ArchiveLimits::memory(64 << 20)
+pub fn limits() -> sevenz_turbo::ArchiveLimits {
+    sevenz_turbo::ArchiveLimits::memory(64 << 20)
 }
 
 /// The ceiling a single run has to stay under. Well above what the limits allow
@@ -93,7 +93,7 @@ pub const MAX_RUN_BYTES: usize = 256 << 20;
 pub fn exercise(bytes: Vec<u8>) {
     use std::io::Read;
 
-    use sevenz_fast::{ArchiveEntry, ArchiveReader, Password};
+    use sevenz_turbo::{ArchiveEntry, ArchiveReader, Password};
 
     reset_peak();
     if let Ok(mut reader) = ArchiveReader::with_limits(

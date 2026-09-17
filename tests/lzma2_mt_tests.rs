@@ -1,6 +1,6 @@
 //! The multi-threaded LZMA2 path: same bytes, more threads.
 //!
-//! `lzma-fast` decodes an LZMA2 stream in parallel by cutting it at the
+//! `lzma-turbo` decodes an LZMA2 stream in parallel by cutting it at the
 //! dictionary resets that make a *run* independently decodable, and this fork
 //! drives that decoder with a thread count the caller can change while the
 //! decode is running. What has to be true of all of it is that none of it is
@@ -16,7 +16,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use sevenz_fast::{ArchiveLimits, ArchiveReader, Password};
+use sevenz_turbo::{ArchiveLimits, ArchiveReader, Password};
 
 fn have_7zz() -> bool {
     Command::new("7zz")
@@ -270,13 +270,13 @@ fn a_memory_limit_too_small_for_threads_degrades_to_single_threaded() {
 /// in the bench table, against `7zz x -so`.
 ///
 /// They are a gigabyte each and live outside the repository, so this runs only
-/// when `SEVENZ_FAST_FIXTURES` points at the directory holding them (in
-/// practice `lzma-fast/bench/fixtures`). Run it with `--release`: in a debug
+/// when `SEVENZ_TURBO_FIXTURES` points at the directory holding them (in
+/// practice `lzma-turbo/bench/fixtures`). Run it with `--release`: in a debug
 /// build it decodes eight gigabytes through an unoptimised decoder.
 #[test]
 fn the_bench_fixtures_decode_identically_at_every_thread_count() {
-    let Ok(dir) = std::env::var("SEVENZ_FAST_FIXTURES") else {
-        eprintln!("skipping: set SEVENZ_FAST_FIXTURES to the fixture directory");
+    let Ok(dir) = std::env::var("SEVENZ_TURBO_FIXTURES") else {
+        eprintln!("skipping: set SEVENZ_TURBO_FIXTURES to the fixture directory");
         return;
     };
     if !have_7zz() {
@@ -456,7 +456,7 @@ fn folding_checksums_equals_checksumming_the_whole() {
     ] {
         let (head, tail) = whole.split_at(cut);
         assert_eq!(
-            sevenz_fast::crc32_combine(crc32(head), crc32(tail), tail.len() as u64),
+            sevenz_turbo::crc32_combine(crc32(head), crc32(tail), tail.len() as u64),
             crc32(&whole),
             "folding at {cut} differs"
         );
@@ -466,8 +466,8 @@ fn folding_checksums_equals_checksumming_the_whole() {
     // boundaries would.
     let (a, rest) = whole.split_at(1000);
     let (b, c) = rest.split_at(5000);
-    let ab = sevenz_fast::crc32_combine(crc32(a), crc32(b), b.len() as u64);
-    let abc = sevenz_fast::crc32_combine(ab, crc32(c), c.len() as u64);
+    let ab = sevenz_turbo::crc32_combine(crc32(a), crc32(b), b.len() as u64);
+    let abc = sevenz_turbo::crc32_combine(ab, crc32(c), c.len() as u64);
     assert_eq!(abc, crc32(&whole), "three-piece fold differs");
 }
 

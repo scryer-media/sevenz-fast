@@ -131,7 +131,7 @@ fn main() {
 
     println!(
         "decode-bench, {runs} run(s) per decoder, median reported, crypto backend {}",
-        sevenz_fast::crypto_backend()
+        sevenz_turbo::crypto_backend()
     );
 
     for file in &files {
@@ -177,7 +177,7 @@ fn io_profile_one(path: &Path, password: Option<&str>) {
     let file = std::fs::File::open(path).expect("open archive");
     let source = CountingSource { inner: file };
     let mut reader =
-        sevenz_fast::ArchiveReader::new(source, fork_password(password)).expect("read header");
+        sevenz_turbo::ArchiveReader::new(source, fork_password(password)).expect("read header");
     reader.set_threads(1);
     let mut sink = Sink::default();
     let mut buf = vec![0u8; 1 << 20];
@@ -298,7 +298,7 @@ fn bench_cipher_only(runs: usize, chunk_len: usize) {
     println!(
         "cipher-only (aws-lc, called directly; crate backend is {}): \
          {:.3}s for {} MiB in {} KiB chunks, {:.1} MiB/s",
-        sevenz_fast::crypto_backend(),
+        sevenz_turbo::crypto_backend(),
         median.as_secs_f64(),
         TOTAL / (1 << 20),
         chunk_len / 1024,
@@ -461,8 +461,8 @@ fn extract_fork(path: &Path, threads: u32, password: Option<&str>) -> Sink {
 }
 
 /// The password each lane gets, or an empty one for an unencrypted archive.
-fn fork_password(password: Option<&str>) -> sevenz_fast::Password {
-    password.map_or_else(sevenz_fast::Password::empty, sevenz_fast::Password::from)
+fn fork_password(password: Option<&str>) -> sevenz_turbo::Password {
+    password.map_or_else(sevenz_turbo::Password::empty, sevenz_turbo::Password::from)
 }
 
 /// The fork, with the header's checksums either checked or not. The unchecked
@@ -471,7 +471,7 @@ fn fork_password(password: Option<&str>) -> sevenz_fast::Password {
 fn extract_fork_with(path: &Path, threads: u32, verify: bool, password: Option<&str>) -> Sink {
     let file = std::fs::File::open(path).expect("open archive");
     let mut reader =
-        sevenz_fast::ArchiveReader::new(file, fork_password(password)).expect("fork: read header");
+        sevenz_turbo::ArchiveReader::new(file, fork_password(password)).expect("fork: read header");
     reader.set_threads(threads);
     reader.set_verify_checksums(verify);
     let mut sink = Sink::default();
@@ -614,13 +614,13 @@ fn bench_one(
     if wanted("fork") {
         for &count in threads {
             rows.push(time_it(
-                format!("sevenz-fast @{count}"),
+                format!("sevenz-turbo @{count}"),
                 Box::new(move || extract_fork(path, count, password)),
             ));
         }
         if let Some(&count) = threads.last() {
             rows.push(time_it(
-                format!("sevenz-fast @{count} no crc"),
+                format!("sevenz-turbo @{count} no crc"),
                 Box::new(move || extract_fork_with(path, count, false, password)),
             ));
         }

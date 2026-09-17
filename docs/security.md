@@ -30,7 +30,7 @@ mutually inconsistent, and the file may stop anywhere.
 
 **What is out of scope.** Cryptographic attacks on AES-256 or on 7z's key
 derivation; a consumer that extracts to a directory it should not have; the
-correctness of a `lzma-fast` decode, which is that crate's contract; and
+correctness of a `lzma-turbo` decode, which is that crate's contract; and
 side-channels. A password is assumed to be the caller's to give.
 
 **The invariant.** *No allocation and no unit of work is sized by a

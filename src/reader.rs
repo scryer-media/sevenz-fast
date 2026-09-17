@@ -8,7 +8,7 @@ use std::{
     sync::Arc,
 };
 
-use lzma_fast::crc::{Crc32, crc32};
+use lzma_turbo::crc::{Crc32, crc32};
 
 use crate::{
     ByteReader, Password,
@@ -16,7 +16,7 @@ use crate::{
     bitset::BitSet,
     block::*,
     codec::filter::bcj2::Bcj2Reader,
-    codec::lzma_fast::{Lzma2Control, Lzma2Handle, Lzma2Progress},
+    codec::lzma_turbo::{Lzma2Control, Lzma2Handle, Lzma2Progress},
     container::{ArchiveLimits, BlockCompletion, SubStreamCompletion},
     decoder::{DecodeOptions, add_decoder},
     error::{Error, Limit},
@@ -225,7 +225,7 @@ impl Archive {
     ///     io::{Read, Seek},
     /// };
     ///
-    /// use sevenz_fast::*;
+    /// use sevenz_turbo::*;
     ///
     /// let mut reader = File::open("example.7z").unwrap();
     ///

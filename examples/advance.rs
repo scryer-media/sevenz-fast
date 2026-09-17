@@ -1,7 +1,7 @@
 use std::{collections::HashMap, env::temp_dir, time::Instant};
 
 use rand::prelude::*;
-use sevenz_fast::{
+use sevenz_turbo::{
     encoder_options::{AesEncoderOptions, Lzma2Options},
     *,
 };

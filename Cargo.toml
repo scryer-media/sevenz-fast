@@ -1,15 +1,15 @@
 [package]
-description = "A 7z decompressor/compressor in pure Rust; a fork of sevenz-rust2 that decodes LZMA and LZMA2 with lzma-fast"
+description = "A 7z decompressor/compressor in pure Rust; a fork of sevenz-rust2 that decodes LZMA and LZMA2 with lzma-turbo"
 edition = "2024"
-homepage = "https://github.com/scryer-media/sevenz-fast"
+homepage = "https://github.com/scryer-media/sevenz-turbo"
 keywords = ["7z", "7zip", "sevenz", "decompress"]
 license = "Apache-2.0"
-name = "sevenz-fast"
+name = "sevenz-turbo"
 readme = "README.md"
-repository = "https://github.com/scryer-media/sevenz-fast"
-# Raised from upstream's 1.93: `lzma-fast` requires 1.97.1.
+repository = "https://github.com/scryer-media/sevenz-turbo"
+# Raised from upstream's 1.93: `lzma-turbo` requires 1.97.1.
 rust-version = "1.97.1"
-version = "0.23.0"
+version = "0.23.1"
 # Repository scaffolding that has no business in the crate archive.
 exclude = [".github/", ".githooks/", ".gitleaks.toml", ".gitattributes", "renovate.json", "AGENTS.md", ".cargo/", "xtask/", "rust-toolchain.toml"]
 
@@ -37,8 +37,8 @@ aes256_wasm = ["aes256", "getrandom/wasm_js"]
 # Enabling `aes256` with neither is a compile error, not a silent choice. The
 # encoder's AES stays on RustCrypto's `cbc::Encryptor`, so `compress` pulls
 # `aes`/`cbc` in regardless of the backend.
-aws-lc-crypto = ["dep:aws-lc-rs", "lzma-fast/crypto"]
-native-crypto = ["dep:aes", "dep:cbc", "lzma-fast/native-crypto"]
+aws-lc-crypto = ["dep:aws-lc-rs", "lzma-turbo/crypto"]
+native-crypto = ["dep:aes", "dep:cbc", "lzma-turbo/native-crypto"]
 brotli = ["dep:brotli"]
 bzip2 = ["dep:bzip2"]
 compress = ["dep:lzma-rust2", "dep:aes", "dep:cbc"]
@@ -50,9 +50,9 @@ zstd = ["dep:zstd"]
 
 [dependencies]
 aes = { version = "0.9", optional = true }
-# The same pin and the same features `lzma-fast` uses, so a build that has both
+# The same pin and the same features `lzma-turbo` uses, so a build that has both
 # crates resolves one copy of AWS-LC. AES-256-CBC is this crate's own (7z
-# cryptography is not `lzma-fast`'s job), so the dependency is direct.
+# cryptography is not `lzma-turbo`'s job), so the dependency is direct.
 aws-lc-rs = { version = "1.18.1", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"], optional = true }
 brotli = { version = ">= 7, < 10", default-features = false, optional = true, features = ["std"] }
 bzip2 = { version = "0.6", optional = true }
@@ -63,7 +63,7 @@ getrandom = { version = "0.4", optional = true }
 # while the two crates are developed together, and is dropped for a release
 # (`cargo xtask release` refuses to tag while it is here). Consumers get both
 # crates from crates.io.
-lzma-fast = { version = "0.3.0", default-features = false, features = ["std", "asm", "crc"] }
+lzma-turbo = { version = "0.3.1", default-features = false, features = ["std", "asm", "crc"] }
 # Encoders only, behind `compress`. The decode path never reaches lzma-rust2;
 # see AGENTS.md.
 lzma-rust2 = { version = "0.20", default-features = false, features = ["std", "encoder", "optimization"], optional = true }

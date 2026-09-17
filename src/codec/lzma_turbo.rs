@@ -1,12 +1,12 @@
-//! The one place in this crate that names `lzma_fast`.
+//! The one place in this crate that names `lzma_turbo`.
 //!
 //! Upstream `sevenz-rust2` decodes the LZMA (`03 01 01`) and LZMA2 (`21`)
 //! coders with `lzma-rust2`. This fork decodes them with
-//! [`lzma-fast`](https://github.com/scryer-media/lzma-fast), a port of Igor
+//! [`lzma-turbo`](https://github.com/scryer-media/lzma-turbo), a port of Igor
 //! Pavlov's reference decoder. Everything that swap needs is behind this
-//! module: adopting `lzma-fast`'s multi-threaded LZMA2 decoder was a change to
+//! module: adopting `lzma-turbo`'s multi-threaded LZMA2 decoder was a change to
 //! this file and to how the reader hands it a thread count, and to nothing
-//! else. What is still asked of that crate is in `docs/lzma-fast-requests.md`;
+//! else. What is still asked of that crate is in `docs/lzma-turbo-requests.md`;
 //! the seam is [`Lzma2Plan`] below.
 
 use std::collections::VecDeque;
@@ -14,8 +14,8 @@ use std::io::Read;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use lzma_fast::crc::CrcFolder;
-use lzma_fast::{
+use lzma_turbo::crc::CrcFolder;
+use lzma_turbo::{
     Checksum, ChecksumPlan, DrainStatus, Lzma2AdaptiveDecoder, Lzma2MtOptions, Lzma2Reader,
     Lzma2RunScanner, LzmaProps, LzmaReader,
 };
@@ -123,8 +123,8 @@ pub(crate) fn lzma_decoder<R: Read>(
 ) -> Result<LzmaReader<R>, std::io::Error> {
     // The caller has already rejected a properties field shorter than five
     // bytes; `LzmaProps::parse` wants exactly five.
-    let mut raw = [0u8; lzma_fast::LZMA_PROPS_SIZE];
-    raw.copy_from_slice(&properties[..lzma_fast::LZMA_PROPS_SIZE]);
+    let mut raw = [0u8; lzma_turbo::LZMA_PROPS_SIZE];
+    raw.copy_from_slice(&properties[..lzma_turbo::LZMA_PROPS_SIZE]);
     // The dictionary the caller settled on, which is the declared one clamped
     // to what the stream can actually reach back into.
     raw[1..5].copy_from_slice(&dict_size.to_le_bytes());
@@ -133,7 +133,7 @@ pub(crate) fn lzma_decoder<R: Read>(
     LzmaReader::with_props(input, props, Some(uncompressed_len as u64))
 }
 /// Bytes of input read from the coder below in one go when the adaptive
-/// decoder asks for more. `lzma-fast`'s own single-threaded path reads in
+/// decoder asks for more. `lzma-turbo`'s own single-threaded path reads in
 /// 1 MiB pieces (`IN_BUF_SIZE_ST`); matching it keeps the feed loop's
 /// bookkeeping off the profile.
 const MT_INPUT_CHUNK: usize = 1 << 20;
@@ -178,7 +178,7 @@ const MT_FEED_PER_THREAD_BYTES: u64 = 128 * 1024 * 1024;
 ///
 /// The cost of that is memory: a batch is buffered packed on the way in and
 /// decoded on the way out, so a gigabyte of read-ahead is about two of peak.
-/// `docs/lzma-fast-requests.md` carries the request that would make it
+/// `docs/lzma-turbo-requests.md` carries the request that would make it
 /// unnecessary — refusing to chase a run while a worker is free would let this
 /// be a run or two per thread again.
 const MT_MIN_FEED_BYTES: u64 = 1024 * 1024 * 1024;
@@ -273,7 +273,7 @@ impl Lzma2Control {
     /// Adds what a worker computed. Called from the decoding thread, as blocks
     /// are delivered; the pieces arrive in whatever order the workers finished
     /// and the folder sorts them out.
-    fn fold_segments(&self, segments: &[lzma_fast::Segment]) {
+    fn fold_segments(&self, segments: &[lzma_turbo::Segment]) {
         if segments.is_empty() {
             return;
         }
@@ -434,7 +434,7 @@ pub struct Lzma2Progress {
 ///
 /// # Why the adaptive decoder and not the ring
 ///
-/// `lzma-fast` has two multi-threaded LZMA2 drivers. `Lzma2ParallelDecoder` is
+/// `lzma-turbo` has two multi-threaded LZMA2 drivers. `Lzma2ParallelDecoder` is
 /// the faithful port of 7-Zip's `Lzma2DecMt.c` over `MtDec.c`: it pulls from a
 /// `Read` and owns the threads for the whole call, which is the fastest way to
 /// decode an archive that is already on disk. Its `Read` adapter spawns the
@@ -610,7 +610,7 @@ pub(crate) struct Lzma2MtReader<R: Read> {
     trace: Option<Box<MtTrace>>,
 }
 
-/// Phase timing for the parallel path, off unless `SEVENZ_FAST_MT_TRACE` is
+/// Phase timing for the parallel path, off unless `SEVENZ_TURBO_MT_TRACE` is
 /// set. See `docs/benchmarking.md`.
 #[derive(Default)]
 pub(crate) struct MtTrace {
@@ -670,7 +670,7 @@ impl<R: Read> Lzma2MtReader<R> {
             finished: false,
             checksums,
             fed_total: 0,
-            trace: std::env::var_os("SEVENZ_FAST_MT_TRACE").map(|_| Box::default()),
+            trace: std::env::var_os("SEVENZ_TURBO_MT_TRACE").map(|_| Box::default()),
         })
     }
 
@@ -1071,7 +1071,7 @@ impl<R: Read> Read for Lzma2MtReader<R> {
     }
 }
 
-fn decode_error(err: lzma_fast::Error) -> std::io::Error {
+fn decode_error(err: lzma_turbo::Error) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, err)
 }
 
