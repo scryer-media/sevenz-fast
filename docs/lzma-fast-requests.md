@@ -89,7 +89,7 @@ multi-threaded path. Checksumming is O(bytes), and the in-order section is the
 one place where the core count does not help, so a checksum taken there is a
 tax that grows with the archive.
 
-`crates/lzma-fast/src/crc.rs` and `crates/lzma-fast/src/mt/checksum.rs`, with
+`src/crc.rs` and `src/mt/checksum.rs`, with
 the plan wired into the **adaptive** decoder — which is the one a 7z coder can
 use:
 
