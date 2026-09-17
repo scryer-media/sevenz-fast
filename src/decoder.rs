@@ -255,9 +255,7 @@ pub fn add_decoder<I: Read>(
                 let bytes = (max_mem_limit_kb as u64).saturating_mul(1024).max(1024);
                 // The largest power of two that fits in the budget, never above
                 // the default and never below the 1 KiB floor the format has.
-                (63 - bytes.leading_zeros())
-                    .min(ZSTD_DEFAULT_WINDOW_LOG)
-                    .max(10)
+                (63 - bytes.leading_zeros()).clamp(10, ZSTD_DEFAULT_WINDOW_LOG)
             };
             zs.window_log_max(window_log)?;
             Ok(Decoder::Zstd(zs))

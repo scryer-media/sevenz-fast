@@ -258,7 +258,7 @@ impl ArchiveEntry {
     #[must_use]
     pub fn unix_mode(&self) -> Option<u32> {
         (self.has_windows_attributes && self.windows_attributes & UNIX_EXTENSION != 0)
-            .then(|| self.windows_attributes >> 16)
+            .then_some(self.windows_attributes >> 16)
     }
 
     /// Whether this entry is a symbolic link rather than a file.
