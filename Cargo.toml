@@ -9,7 +9,7 @@ readme = "README.md"
 repository = "https://github.com/scryer-media/sevenz-turbo"
 # Raised from upstream's 1.93: `lzma-turbo` requires 1.97.1.
 rust-version = "1.97.1"
-version = "0.23.1"
+version = "0.23.2"
 # Repository scaffolding that has no business in the crate archive.
 exclude = [".github/", ".githooks/", ".gitleaks.toml", ".gitattributes", "renovate.json", "AGENTS.md", ".cargo/", "xtask/", "rust-toolchain.toml"]
 
@@ -63,7 +63,7 @@ getrandom = { version = "0.4", optional = true }
 # while the two crates are developed together, and is dropped for a release
 # (`cargo xtask release` refuses to tag while it is here). Consumers get both
 # crates from crates.io.
-lzma-turbo = { version = "0.3.1", default-features = false, features = ["std", "asm", "crc"] }
+lzma-turbo = { version = "0.3.3", default-features = false, features = ["std", "asm", "crc"] }
 # Encoders only, behind `compress`. The decode path never reaches lzma-rust2;
 # see AGENTS.md.
 lzma-rust2 = { version = "0.20", default-features = false, features = ["std", "encoder", "optimization"], optional = true }

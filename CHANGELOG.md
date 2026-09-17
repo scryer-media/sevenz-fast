@@ -338,6 +338,12 @@ Everything here is new surface; no upstream signature changed meaning.
   reading the binary fixtures `lzma-rust2` keeps in its repository, which are
   not ours to vendor.
 
+## 0.23.2 - 2026-09-17
+
+- Raised `lzma-turbo` to 0.3.3. It fixes an `.xz` block that declares no
+  uncompressed size and runs past the caller's output cap: that was reported as
+  corrupt data instead of a cap hit.
+
 ## 0.23.1 - 2026-09-17
 
 The first release under the name `sevenz-turbo`, on `lzma-turbo` 0.3.1. The code
