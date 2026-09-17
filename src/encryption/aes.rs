@@ -21,13 +21,26 @@ fn crypto_error(err: AesError) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, err)
 }
 
+/// The 7z `aes256` decoder.
+///
+/// The packed stream is decrypted **in the caller's own buffer**: a read fills
+/// `buf` with ciphertext straight from the layer below and decrypts it there,
+/// so a gigabyte of payload is copied zero extra times and the reads are as
+/// large as the caller's buffer rather than a fixed small block. CBC needs no
+/// more state than that — 16 ciphertext bytes that did not complete a block
+/// (`carry`), and, when a caller reads less than one block at a time, the
+/// plaintext of the block that call had to decrypt (`plain`).
 pub(crate) struct Aes256Sha256Decoder<R> {
-    cipher: Cipher,
+    cipher: Aes256Cbc,
     input: R,
     done: bool,
-    obuffer: Vec<u8>,
-    ostart: usize,
-    ofinish: usize,
+    /// Ciphertext that did not fill a block, waiting for the next read.
+    carry: [u8; AES_BLOCK_LEN],
+    carry_len: usize,
+    /// Plaintext decrypted for a caller whose buffer was smaller than a block.
+    plain: [u8; AES_BLOCK_LEN],
+    plain_start: usize,
+    plain_end: usize,
     pos: usize,
 }
 
@@ -38,70 +51,113 @@ impl<R: Read> Aes256Sha256Decoder<R> {
         password: &Password,
         max_cycles_power: u8,
     ) -> Result<Self, crate::Error> {
-        let cipher = Cipher::from_properties(properties, password.as_slice(), max_cycles_power)?;
+        let (aes_key, iv) = get_aes_key(properties, password.as_slice(), max_cycles_power)?;
+        let cipher =
+            Aes256Cbc::new(&aes_key, &iv).map_err(|err| crate::Error::other(err.to_string()))?;
         Ok(Self {
             input,
             cipher,
             done: false,
-            obuffer: Default::default(),
-            ostart: 0,
-            ofinish: 0,
+            carry: [0; AES_BLOCK_LEN],
+            carry_len: 0,
+            plain: [0; AES_BLOCK_LEN],
+            plain_start: 0,
+            plain_end: 0,
             pos: 0,
         })
     }
 
-    fn get_more_data(&mut self) -> std::io::Result<usize> {
-        if self.done {
+    /// The stream ended. A partial block left over is a damaged or truncated
+    /// archive: 7z ciphertext is always a whole number of blocks.
+    fn finish(&mut self) -> std::io::Result<usize> {
+        self.done = true;
+        if self.carry_len == 0 {
             Ok(0)
         } else {
-            self.ofinish = 0;
-            self.ostart = 0;
-            self.obuffer.clear();
-            let mut ibuffer = [0; 512];
-            let readin = self.input.read(&mut ibuffer)?;
-            if readin == 0 {
-                self.done = true;
-                self.ofinish = self.cipher.do_final(&mut self.obuffer)?;
-                Ok(self.ofinish)
-            } else {
-                let n = self
-                    .cipher
-                    .update(&mut ibuffer[..readin], &mut self.obuffer)?;
-                self.ofinish = n;
-                Ok(n)
-            }
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "IllegalBlockSize",
+            ))
         }
+    }
+
+    /// Decrypts one block into `plain`, for a caller reading less than a block
+    /// at a time. Only such callers pay for this copy.
+    fn fill_one_block(&mut self) -> std::io::Result<usize> {
+        while self.carry_len < AES_BLOCK_LEN {
+            let read = self.input.read(&mut self.carry[self.carry_len..])?;
+            if read == 0 {
+                return self.finish();
+            }
+            self.carry_len += read;
+        }
+        self.plain = self.carry;
+        self.carry_len = 0;
+        self.cipher.decrypt(&mut self.plain).map_err(crypto_error)?;
+        self.plain_start = 0;
+        self.plain_end = AES_BLOCK_LEN;
+        Ok(AES_BLOCK_LEN)
+    }
+
+    /// Hands over whatever of `plain` is still undelivered.
+    fn drain_plain(&mut self, buf: &mut [u8]) -> usize {
+        let size = (self.plain_end - self.plain_start).min(buf.len());
+        buf[..size].copy_from_slice(&self.plain[self.plain_start..self.plain_start + size]);
+        self.plain_start += size;
+        self.pos += size;
+        size
     }
 }
 
 impl<R: Read> Read for Aes256Sha256Decoder<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if self.ostart >= self.ofinish {
-            let mut n: usize;
-            n = self.get_more_data()?;
-            while n == 0 && !self.done {
-                n = self.get_more_data()?;
-            }
-            if n == 0 {
-                return Ok(0);
-            }
-        }
-
         if buf.is_empty() {
             return Ok(0);
         }
-        let buf_len = self.ofinish - self.ostart;
-        let size = buf_len.min(buf.len());
-        buf[..size].copy_from_slice(&self.obuffer[self.ostart..self.ostart + size]);
-        self.ostart += size;
-        self.pos += size;
-        Ok(size)
+        if self.plain_start < self.plain_end {
+            return Ok(self.drain_plain(buf));
+        }
+        if self.done {
+            return Ok(0);
+        }
+        if buf.len() < AES_BLOCK_LEN {
+            if self.fill_one_block()? == 0 {
+                return Ok(0);
+            }
+            return Ok(self.drain_plain(buf));
+        }
+
+        // The bulk path. Everything below happens inside `buf`.
+        let capacity = buf.len() - buf.len() % AES_BLOCK_LEN;
+        buf[..self.carry_len].copy_from_slice(&self.carry[..self.carry_len]);
+        let mut filled = self.carry_len;
+        self.carry_len = 0;
+        while filled < AES_BLOCK_LEN {
+            let read = self.input.read(&mut buf[filled..capacity])?;
+            if read == 0 {
+                self.carry[..filled].copy_from_slice(&buf[..filled]);
+                self.carry_len = filled;
+                return self.finish();
+            }
+            filled += read;
+        }
+
+        let whole = filled - filled % AES_BLOCK_LEN;
+        self.carry_len = filled - whole;
+        self.carry[..self.carry_len].copy_from_slice(&buf[whole..filled]);
+        self.cipher
+            .decrypt(&mut buf[..whole])
+            .map_err(crypto_error)?;
+        self.pos += whole;
+        Ok(whole)
     }
 }
 
 impl<R: Read + Seek> Seek for Aes256Sha256Decoder<R> {
     fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
-        let len = self.ofinish - self.ostart;
+        // Only a forward skip inside what is already decrypted is supported,
+        // which is what this was ever asked for; the buffer is now one block.
+        let len = self.plain_end - self.plain_start;
         match pos {
             std::io::SeekFrom::Start(p) => {
                 let n = (p as i64 - self.pos as i64).min(len as i64);
@@ -109,7 +165,7 @@ impl<R: Read + Seek> Seek for Aes256Sha256Decoder<R> {
                 if n < 0 {
                     Ok(0)
                 } else {
-                    self.ostart += n as usize;
+                    self.plain_start += n as usize;
                     Ok(p)
                 }
             }
@@ -122,7 +178,7 @@ impl<R: Read + Seek> Seek for Aes256Sha256Decoder<R> {
                 if n < 0 {
                     Ok(0)
                 } else {
-                    self.ostart += n as usize;
+                    self.plain_start += n as usize;
                     Ok(self.pos as u64 + n as u64)
                 }
             }
@@ -251,70 +307,6 @@ fn derive_key_cached(num_cycles_power: u8, salt: &[u8], password: &[u8]) -> [u8;
     let key = derive_key(num_cycles_power, salt, password);
     *KEY_CACHE.lock().unwrap() = Some((fingerprint, key));
     key
-}
-
-struct Cipher {
-    dec: Aes256Cbc,
-    buf: Vec<u8>,
-}
-
-impl Cipher {
-    fn from_properties(
-        properties: &[u8],
-        password: &[u8],
-        max_cycles_power: u8,
-    ) -> Result<Self, crate::Error> {
-        let (aes_key, iv) = get_aes_key(properties, password, max_cycles_power)?;
-        Ok(Self {
-            dec: Aes256Cbc::new(&aes_key, &iv)
-                .map_err(|err| crate::Error::other(err.to_string()))?,
-            buf: Default::default(),
-        })
-    }
-
-    fn update<W: Write>(&mut self, mut data: &mut [u8], mut output: W) -> std::io::Result<usize> {
-        let mut n = 0;
-        if !self.buf.is_empty() {
-            assert!(self.buf.len() < AES_BLOCK_LEN);
-            let end = AES_BLOCK_LEN - self.buf.len();
-            if data.len() < end {
-                // A short read (e.g. AES layered on top of another coder, whose reader can
-                // return fewer than 16 bytes) delivered less than what is needed to complete
-                // the pending block. Buffer what we have and wait for more; slicing
-                // `data[..end]` here would panic.
-                self.buf.extend_from_slice(data);
-                return Ok(n);
-            }
-            self.buf.extend_from_slice(&data[..end]);
-            data = &mut data[end..];
-            self.dec.decrypt(&mut self.buf).map_err(crypto_error)?;
-            output.write_all(&self.buf)?;
-            n += self.buf.len();
-            self.buf.clear();
-        }
-
-        let whole = data.len() - data.len() % AES_BLOCK_LEN;
-        let (blocks, remainder) = data.split_at_mut(whole);
-        if !blocks.is_empty() {
-            self.dec.decrypt(blocks).map_err(crypto_error)?;
-            output.write_all(blocks)?;
-            n += blocks.len();
-        }
-        self.buf.extend_from_slice(remainder);
-        Ok(n)
-    }
-
-    fn do_final(&mut self, output: &mut Vec<u8>) -> std::io::Result<usize> {
-        if self.buf.is_empty() {
-            output.clear();
-            Ok(0)
-        } else {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "IllegalBlockSize",
-            ))
-        }
-    }
 }
 
 #[cfg(feature = "compress")]
