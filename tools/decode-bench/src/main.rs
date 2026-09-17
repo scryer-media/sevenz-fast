@@ -33,7 +33,8 @@ usage: decode-bench [--runs N] [--no-oracle] [--threads LIST] [--password P] <ar
   --no-oracle     skip the `7zz t` lanes
   --only NAME     run only `7zz`, `upstream` or `fork`
   --threads LIST  fork thread counts, comma separated (default 1,2,8,all)
-  --password P    password for an AES-256 archive, passed to every lane";
+  --password P    password for an AES-256 archive, passed to every lane
+  --cipher-only   time AES-256-CBC alone over 1 GiB in memory and exit";
 
 fn main() {
     let mut runs = 3usize;
@@ -42,6 +43,7 @@ fn main() {
     let mut only = String::new();
     let mut threads: Vec<u32> = Vec::new();
     let mut password: Option<String> = None;
+    let mut cipher_only = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -62,6 +64,7 @@ fn main() {
                     .unwrap_or_else(|| fail("--threads needs a list"));
                 threads = list.split(',').map(parse_threads).collect();
             }
+            "--cipher-only" => cipher_only = true,
             "--password" => {
                 password = Some(args.next().unwrap_or_else(|| fail("--password needs a value")));
             }
@@ -72,6 +75,11 @@ fn main() {
             other if other.starts_with('-') => fail(&format!("unknown option {other}")),
             other => files.push(PathBuf::from(other)),
         }
+    }
+
+    if cipher_only {
+        bench_cipher_only(runs);
+        return;
     }
 
     if files.is_empty() {
@@ -92,6 +100,56 @@ fn main() {
     for file in &files {
         bench_one(file, runs, oracle, &only, &threads, password.as_deref());
     }
+}
+
+/// AES-256-CBC on its own: 1 GiB already in memory, decrypted in 1 MiB chunks
+/// with the IV carried between them, which is exactly what the reader does
+/// minus the reading. It is the floor any archive lane can reach, and the
+/// number the plumbing around the cipher is read against.
+fn bench_cipher_only(runs: usize) {
+    use aws_lc_rs::cipher::{AES_256, DecryptingKey, DecryptionContext, UnboundCipherKey};
+    use aws_lc_rs::iv::FixedLength;
+
+    const TOTAL: usize = 1 << 30;
+    const CHUNK: usize = 1 << 20;
+
+    let key = [0x5au8; 32];
+    let mut data = vec![0u8; TOTAL];
+    // Something other than zeroes, so nothing can be optimised into a memset.
+    let mut state = 0x243f_6a88_85a3_08d3u64;
+    for byte in data.iter_mut() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        *byte = (state >> 24) as u8;
+    }
+
+    let mut times = Vec::new();
+    for _ in 0..runs {
+        let unbound = UnboundCipherKey::new(&AES_256, &key).expect("key");
+        let cipher = DecryptingKey::cbc(unbound).expect("cbc");
+        let mut iv = [0u8; 16];
+        let start = Instant::now();
+        for chunk in data.chunks_mut(CHUNK) {
+            let mut next = [0u8; 16];
+            next.copy_from_slice(&chunk[chunk.len() - 16..]);
+            cipher
+                .decrypt(chunk, DecryptionContext::Iv128(FixedLength::from(iv)))
+                .expect("decrypt");
+            iv = next;
+        }
+        times.push(start.elapsed());
+    }
+
+    let median = median(times);
+    println!(
+        "cipher-only ({} backend): {:.3}s for {} MiB in {} KiB chunks, {:.1} MiB/s",
+        sevenz_fast::crypto_backend(),
+        median.as_secs_f64(),
+        TOTAL / (1 << 20),
+        CHUNK / 1024,
+        (TOTAL / (1 << 20)) as f64 / median.as_secs_f64()
+    );
 }
 
 /// Every thread this machine has, which is what "all" means in the tables.

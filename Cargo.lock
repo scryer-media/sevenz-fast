@@ -294,6 +294,7 @@ dependencies = [
 name = "decode-bench"
 version = "0.0.0"
 dependencies = [
+ "aws-lc-rs",
  "sevenz-fast",
  "sevenz-rust2",
 ]

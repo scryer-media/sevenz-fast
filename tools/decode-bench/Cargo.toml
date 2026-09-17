@@ -15,6 +15,9 @@ version = "0.0.0"
 native-crypto = ["sevenz-fast/native-crypto"]
 
 [dependencies]
+# Timed directly by `--cipher-only`, to price AES-256-CBC on its own against
+# the reader chain that carries it. Same pin as the crate's.
+aws-lc-rs = { version = "1.18.1", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
 # The fork under test.
 sevenz-fast = { path = "../..", default-features = false, features = ["aes256", "aws-lc-crypto", "brotli", "bzip2", "deflate", "lz4", "ppmd", "util", "zstd"] }
 # The baseline the fork has to beat: the exact release weaver ships today.
