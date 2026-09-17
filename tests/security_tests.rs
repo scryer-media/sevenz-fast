@@ -4,7 +4,9 @@
 
 use std::io::Cursor;
 
-use sevenz_fast::{ArchiveEntry, ArchiveReader, ArchiveWriter, Password, decompress};
+use sevenz_fast::{
+    ArchiveEntry, ArchiveLimits, ArchiveReader, ArchiveWriter, Error, Limit, Password, decompress,
+};
 use tempfile::tempdir;
 
 /// Builds a valid single-file archive whose only entry has the given (attacker-chosen) name.
@@ -681,4 +683,296 @@ fn aes_raw_key_mode_does_not_panic() {
             Ok(true)
         });
     }
+}
+
+// ---------------------------------------------------------------------------
+// One crafted archive per bound in `ArchiveLimits`.
+//
+// Each of these is the archive the limit exists for: the smallest header that
+// asks for more than the limit allows, opened with the limits a caller would
+// use. The assertion is always the same shape — the open fails, and it fails
+// naming the bound that stopped it, not as a generic parse error.
+// ---------------------------------------------------------------------------
+
+/// Opens `bytes` with `limits`, returning the bound that refused it.
+fn limit_hit(bytes: &[u8], limits: ArchiveLimits) -> Option<Limit> {
+    match ArchiveReader::with_limits(Cursor::new(bytes.to_vec()), Password::empty(), limits) {
+        Ok(_) => None,
+        Err(e) => e.limit_hit(),
+    }
+}
+
+/// A block chaining more coders than `max_coders_per_block` allows must be
+/// refused before the coders are read, let alone built.
+#[test]
+fn too_many_coders_in_one_block_is_refused() {
+    let mut nh = vec![
+        K_HEADER,
+        K_MAIN_STREAMS_INFO,
+        K_UNPACK_INFO,
+        K_FOLDER,
+        0x01, // num_blocks = 1
+        0x00, // external = 0
+    ];
+    write_number(&mut nh, 9); // num_coders, one above the default of 8
+    for _ in 0..9 {
+        nh.extend_from_slice(&[0x01, 0x00]); // simple coder, one-byte id
+    }
+    assert_eq!(
+        limit_hit(&raw_7z_exact(&nh), ArchiveLimits::default()),
+        Some(Limit::CodersPerBlock)
+    );
+}
+
+/// More entries than `max_entries`, in a header big enough that the byte bound
+/// alone would let it through: eight names is sixteen bytes of header.
+#[test]
+fn more_entries_than_the_limit_allows_is_refused() {
+    let mut nh = vec![K_HEADER, K_FILES_INFO];
+    write_number(&mut nh, 8); // num_files
+    nh.push(K_NAME);
+    write_number(&mut nh, 1 + 8 * 2); // size: external byte + eight empty UTF-16 names
+    nh.push(0x00); // external = 0
+    nh.extend_from_slice(&[0u8; 16]);
+    nh.push(K_END);
+    nh.push(K_END);
+
+    let limits = ArchiveLimits {
+        max_entries: 4,
+        ..ArchiveLimits::default()
+    };
+    assert_eq!(limit_hit(&raw_7z_exact(&nh), limits), Some(Limit::Entries));
+    // The same archive is fine at the default limit.
+    assert_eq!(
+        limit_hit(&raw_7z_exact(&nh), ArchiveLimits::default()),
+        None
+    );
+}
+
+/// A coder whose own output feeds its own input. Following it builds a decoder
+/// stack that never terminates, so the graph is rejected at parse time.
+#[test]
+fn a_cycle_in_the_coder_graph_is_rejected() {
+    let nh = vec![
+        K_HEADER,
+        K_MAIN_STREAMS_INFO,
+        K_UNPACK_INFO,
+        K_FOLDER,
+        0x01, // num_blocks = 1
+        0x00, // external = 0
+        0x01, // num_coders = 1
+        0x11, // coder flags: id_size=1, not simple (explicit stream counts)
+        0x00, // coder id
+        0x02, // num_in_streams = 2
+        0x02, // num_out_streams = 2
+        // one bind pair (total_out - 1): in stream 0 fed by out stream 1, which
+        // is the same coder's own second output.
+        0x00, // bind pair in_index = 0
+        0x01, // bind pair out_index = 1
+        0x01, // packed stream index = 1
+        K_CODERS_UNPACK_SIZE,
+        0x10,
+        0x10, // unpack sizes
+        K_END,
+        K_END,
+        K_END,
+    ];
+    assert!(
+        open_err(&raw_7z_exact(&nh)).is_err(),
+        "a coder graph with a cycle must be rejected"
+    );
+}
+
+/// Pack streams that run past the end of the file: the sizes are header numbers
+/// and the reader seeks by them, so they have to be inside the archive.
+#[test]
+fn pack_streams_past_the_end_of_the_file_are_rejected() {
+    let mut nh = vec![
+        K_HEADER,
+        K_MAIN_STREAMS_INFO,
+        K_PACK_INFO,
+        0x00, // pack_pos
+        0x01, // num_pack_streams = 1
+        K_SIZE,
+    ];
+    write_number(&mut nh, 1u64 << 40); // one terabyte of "packed" bytes
+    nh.extend_from_slice(&[K_END, K_END, K_END]);
+    assert!(
+        open_err(&raw_7z_exact(&nh)).is_err(),
+        "pack streams past the end of the archive must be rejected"
+    );
+}
+
+/// The declared output is checked against `max_unpack_bytes` before any of it
+/// is produced.
+#[test]
+fn a_declared_bomb_is_refused_before_decoding() {
+    let bytes = archive_with_entry_name("payload.bin");
+    assert_eq!(
+        limit_hit(&bytes, ArchiveLimits::default().with_max_unpack_bytes(1)),
+        Some(Limit::UnpackBytes)
+    );
+    assert_eq!(
+        limit_hit(
+            &bytes,
+            ArchiveLimits::default().with_max_unpack_bytes(1 << 20)
+        ),
+        None
+    );
+}
+
+/// A name that escapes the extraction directory is reported per entry, and
+/// refused outright when the caller asks for that.
+#[test]
+fn unsafe_entry_names_are_reported_and_can_be_refused() {
+    for name in [
+        "../escape.txt",
+        "..\\escape.txt",
+        "/etc/passwd",
+        "C:\\windows\\system32\\x",
+    ] {
+        let bytes = archive_with_entry_name(name);
+
+        let reader = ArchiveReader::new(Cursor::new(bytes.clone()), Password::empty()).unwrap();
+        let entries: Vec<_> = reader.archive().files.clone();
+        assert!(
+            entries[0].is_unsafe_path(),
+            "{name} should be reported as unsafe"
+        );
+        assert!(entries[0].unsafe_path_reason().is_some());
+
+        let refused = ArchiveReader::with_limits(
+            Cursor::new(bytes),
+            Password::empty(),
+            ArchiveLimits::default().rejecting_unsafe_paths(),
+        );
+        assert!(
+            matches!(refused, Err(Error::UnsafeEntryName { .. })),
+            "{name} should make the archive unreadable when the caller asks"
+        );
+    }
+
+    // An ordinary name is neither reported nor refused.
+    let ok = archive_with_entry_name("dir/file.txt");
+    let reader = ArchiveReader::new(Cursor::new(ok.clone()), Password::empty()).unwrap();
+    assert!(!reader.archive().files[0].is_unsafe_path());
+    assert!(
+        ArchiveReader::with_limits(
+            Cursor::new(ok),
+            Password::empty(),
+            ArchiveLimits::default().rejecting_unsafe_paths(),
+        )
+        .is_ok()
+    );
+}
+
+/// A symlink is an ordinary entry whose content is the link target, so a
+/// consumer has to be able to tell it apart from a small text file.
+#[test]
+fn symlink_entries_are_surfaced() {
+    let mut bytes = Vec::new();
+    {
+        let mut writer = ArchiveWriter::new(Cursor::new(&mut bytes)).unwrap();
+        let mut entry = ArchiveEntry::new_file("link");
+        entry.has_windows_attributes = true;
+        // Unix extension bit, with mode 0o120777 (S_IFLNK | rwxrwxrwx) above it.
+        entry.windows_attributes = 0x8000 | (0o120777u32 << 16);
+        writer
+            .push_archive_entry(entry, Some(b"../outside" as &[u8]))
+            .unwrap();
+        writer.finish().unwrap();
+    }
+    let reader = ArchiveReader::new(Cursor::new(bytes), Password::empty()).unwrap();
+    let entry = &reader.archive().files[0];
+    assert!(entry.is_symlink(), "a symlink entry must say so");
+    assert_eq!(entry.unix_mode(), Some(0o120777));
+    assert!(
+        !entry.is_unsafe_path(),
+        "the entry's own name is safe; the target is what needs checking"
+    );
+}
+
+/// A compressed header is buffered whole before it can be parsed, so the size
+/// it declares is bounded; `solid.7z` has one, and a caller who will not spend
+/// a kilobyte on a header is told which bound stopped it.
+#[test]
+fn an_encoded_header_larger_than_the_limit_is_refused() {
+    let bytes = std::fs::read("tests/resources/solid.7z").unwrap();
+    let limits = ArchiveLimits {
+        max_header_unpacked_bytes: 1,
+        ..ArchiveLimits::default()
+    };
+    assert_eq!(
+        limit_hit(&bytes, limits),
+        Some(Limit::HeaderUnpackedBytes),
+        "an encoded header over the bound must be refused before it is buffered"
+    );
+    // The same archive opens at the default.
+    assert_eq!(limit_hit(&bytes, ArchiveLimits::default()), None);
+}
+
+/// A nested compressed header — one that decodes to another — is refused as the
+/// unbounded recursion it would be, whatever it claims to contain.
+#[test]
+fn a_header_nested_deeper_than_the_limit_is_refused() {
+    let bytes = std::fs::read("tests/resources/solid.7z").unwrap();
+    let limits = ArchiveLimits {
+        max_header_depth: 1,
+        ..ArchiveLimits::default()
+    };
+    assert_eq!(limit_hit(&bytes, limits), Some(Limit::HeaderDepth));
+}
+
+/// The AES key-derivation work factor is the caller's, and a header asking for
+/// more is refused before a single SHA-256 round is run.
+#[cfg(feature = "aes256")]
+#[test]
+fn an_aes_work_factor_over_the_limit_is_refused() {
+    let nh = &[
+        K_HEADER,
+        K_MAIN_STREAMS_INFO,
+        K_PACK_INFO,
+        0x00, // pack_pos
+        0x01, // num_pack_streams
+        K_SIZE,
+        0x10, // pack_sizes[0] = 16
+        K_END,
+        K_UNPACK_INFO,
+        K_FOLDER,
+        0x01, // num_blocks
+        0x00, // external
+        0x01, // num_coders
+        0x24, // coder flags: id_size=4, simple, has_attributes
+        0x06,
+        0xF1,
+        0x07,
+        0x01, // coder id = AES256-SHA256
+        0x02, // properties_size = 2
+        0x14, // num_cycles_power = 20
+        0x00, // salt/iv sizes = 0
+        K_CODERS_UNPACK_SIZE,
+        0x05, // unpack_sizes[0] = 5
+        K_END,
+        K_SUB_STREAMS_INFO,
+        K_END,
+        K_END,
+        K_FILES_INFO,
+        0x01,  // num_files = 1
+        K_END, // files_info props end
+        K_END, // header end
+    ];
+    let bytes = raw_7z_with_packed(&[0u8; 16], nh);
+    let limits = ArchiveLimits {
+        max_aes_cycles_power: 4,
+        ..ArchiveLimits::default()
+    };
+    let mut reader =
+        ArchiveReader::with_limits(Cursor::new(bytes), Password::from("x"), limits).unwrap();
+    let err = reader
+        .for_each_entries(&mut |_e: &ArchiveEntry, rd: &mut dyn std::io::Read| {
+            let _ = std::io::copy(rd, &mut std::io::sink());
+            Ok(true)
+        })
+        .expect_err("a work factor over the caller's limit must be refused");
+    assert_eq!(err.limit_hit(), Some(Limit::AesCyclesPower));
 }

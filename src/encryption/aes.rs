@@ -486,14 +486,25 @@ mod key_derivation_tests {
         let salt = b"salt";
         for power in [MAX_AES_CYCLES_POWER + 1, 40, 62] {
             assert!(
-                get_aes_key(&properties(power, salt, &[0u8; 16]), b"pw", MAX_AES_CYCLES_POWER)
-                    .is_err(),
+                get_aes_key(
+                    &properties(power, salt, &[0u8; 16]),
+                    b"pw",
+                    MAX_AES_CYCLES_POWER
+                )
+                .is_err(),
                 "cycle count {power} was accepted"
             );
         }
         // The cap itself is 2^24 SHA-256 rounds, far too slow for a test; that
         // an ordinary count is accepted is covered by the round-trip tests.
-        assert!(get_aes_key(&properties(4, salt, &[0u8; 16]), b"pw", MAX_AES_CYCLES_POWER).is_ok());
+        assert!(
+            get_aes_key(
+                &properties(4, salt, &[0u8; 16]),
+                b"pw",
+                MAX_AES_CYCLES_POWER
+            )
+            .is_ok()
+        );
     }
 
     #[test]

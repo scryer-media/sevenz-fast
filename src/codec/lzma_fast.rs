@@ -1057,6 +1057,35 @@ pub(crate) fn lzma2_decoder<R: Read>(
 mod tests {
     use super::*;
 
+    /// A dictionary is only ever as big as the output it could be read from.
+    #[test]
+    fn a_dictionary_is_clamped_to_the_output_it_serves() {
+        // A gigabyte of dictionary for a kilobyte of output.
+        assert_eq!(clamp_dictionary(1 << 30, 1024), 4096);
+        // Never below the smallest dictionary the format expresses.
+        assert_eq!(clamp_dictionary(1 << 30, 0), 4096);
+        // A dictionary smaller than the output is left alone: the stream needs it.
+        assert_eq!(clamp_dictionary(1 << 20, 1 << 30), 1 << 20);
+        // And so is one that exactly fits.
+        assert_eq!(clamp_dictionary(1 << 20, 1 << 20), 1 << 20);
+    }
+
+    /// LZMA2 carries the dictionary as a table index, so the clamp has to round
+    /// back up to a value the table can express — never past what was declared.
+    #[test]
+    fn a_clamped_lzma2_property_stays_in_the_table() {
+        // 16 MiB declared, 1 KiB of output: the smallest entry, 4 KiB.
+        assert_eq!(lzma2_clamped_prop(24, 1024), 0);
+        // 16 MiB declared for 10 MiB of output: the smallest entry that covers it.
+        let prop = lzma2_clamped_prop(24, 10 << 20);
+        assert!(u64::from(lzma2_dictionary_size(&[prop]).unwrap()) >= 10 << 20);
+        assert!(prop < 24);
+        // A stream that needs all of what it declared keeps it.
+        assert_eq!(lzma2_clamped_prop(24, 1 << 30), 24);
+        // A property byte the table does not have is left for the decoder to reject.
+        assert_eq!(lzma2_clamped_prop(41, 1024), 41);
+    }
+
     /// The property byte table, against the values the reference decoder
     /// computes for the ends and a midpoint of the range.
     #[test]
