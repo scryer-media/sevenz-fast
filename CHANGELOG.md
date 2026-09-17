@@ -351,6 +351,11 @@ the fork point and ship here for the first time.
 - Reject unsupported LZMA and LZMA2 encoder dictionary sizes with an error before allocating the encoder or starting
   compression workers, avoiding capacity-overflow panics.
 - Improved decompression performance for non-solid 7z archives containing many files.
+- Threaded LZMA2 decoding of archives made of many small runs - what `7zz -mx1` writes for data that does not
+  compress, 1 MiB a run - scales with the thread count. It took two changes: `lzma-fast` 0.3.0 no longer moves its
+  whole input buffer after every run, and the reader here stops reading ahead once there are two runs per thread
+  waiting and tops that up before every drain, instead of reading a gigabyte before the first worker started. A 1 GiB
+  archive of that shape at 18 threads: 4.6 s before, 1.1 s after, level with `7zz t`.
 
 ## 0.22.2 - 2026-08-25
 

@@ -183,6 +183,19 @@ const MT_FEED_PER_THREAD_BYTES: u64 = 128 * 1024 * 1024;
 /// be a run or two per thread again.
 const MT_MIN_FEED_BYTES: u64 = 1024 * 1024 * 1024;
 
+/// Complete runs to keep waiting in the decoder, per thread.
+///
+/// The read-ahead above is a ceiling on bytes, and reaching it in one go is
+/// wrong when runs are small: `7zz -mx1` writes 1 MiB runs for data that does
+/// not compress, a gigabyte of read-ahead is then a thousand runs, and every
+/// worker sat idle while this thread read and copied all of them - 0.2 s of a
+/// 1.3 s decode. So a feed stops once there are this many runs per thread
+/// waiting, and is topped up before every drain instead, while the workers are
+/// busy. Two per thread means a worker that finishes always finds a run there
+/// even if the top-up is a whole read behind. With 128 MiB runs the byte
+/// ceiling is reached first and nothing changes.
+const MT_BACKLOG_RUNS_PER_THREAD: u64 = 2;
+
 /// The floor under the in-flight budget, so that [`MT_MIN_FEED_BYTES`] of
 /// read-ahead is affordable at any thread count: the read-ahead is never given
 /// more than half of what the decoder may hold, the other half being the runs
@@ -701,6 +714,12 @@ impl<R: Read> Lzma2MtReader<R> {
         }
     }
 
+    /// How many more complete runs the decoder should be holding than it is.
+    fn backlog_wanted(&self) -> u64 {
+        let full = u64::from(self.applied_threads.max(1)) * MT_BACKLOG_RUNS_PER_THREAD;
+        full.saturating_sub(self.decoder.pending_runs() as u64)
+    }
+
     /// The stream offset past which feeding would put the decoder's chase
     /// path inside a run.
     ///
@@ -791,9 +810,16 @@ impl<R: Read> Lzma2MtReader<R> {
     /// has nothing left to do — a block written as a single run, or the tail
     /// of one still arriving — is the chase path handed a partial run, which
     /// is the case it exists for.
-    fn pump_input(&mut self) -> std::io::Result<bool> {
+    ///
+    /// `want_runs` ends the call early, once that many more runs have been
+    /// seen and something has been fed: see [`MT_BACKLOG_RUNS_PER_THREAD`].
+    fn pump_input(&mut self, want_runs: u64) -> std::io::Result<bool> {
         let mut fed = false;
+        let runs_at_start = self.runs_seen;
         loop {
+            if fed && self.runs_seen - runs_at_start >= want_runs {
+                break;
+            }
             // A stream whose first run has not ended within a good look at it
             // is a stream with one run in it — what `7zz -mmt=1` writes — and
             // no amount of reading ahead will find a second worker anything to
@@ -921,6 +947,19 @@ impl<R: Read> Read for Lzma2MtReader<R> {
 
             self.sync_threads();
 
+            // Keep the backlog up while the workers are busy, rather than
+            // waiting for the decoder to run dry and ask.
+            if !self.input_done {
+                let want = self.backlog_wanted();
+                if want > 0 {
+                    let t1 = std::time::Instant::now();
+                    self.pump_input(want)?;
+                    if let Some(t) = self.trace.as_mut() {
+                        t.pump += t1.elapsed();
+                    }
+                }
+            }
+
             // The decoder is asked for no more than `buf` holds, so what it
             // hands over goes straight into the caller's buffer and the rest
             // of the block it was in stays with the decoder for the next
@@ -935,6 +974,9 @@ impl<R: Read> Read for Lzma2MtReader<R> {
             // The call borrows the decoder mutably and the sink needs the
             // spill buffer, so the buffer is lent to the call and taken back.
             let mut direct = 0usize;
+            // Whether the decoder knew, going into this drain, that it had
+            // been given everything.
+            let told_the_end = self.input_done;
             let t0 = std::time::Instant::now();
             let mut out = std::mem::take(&mut self.out);
             let mut spare = std::mem::take(&mut self.spare);
@@ -1005,11 +1047,11 @@ impl<R: Read> Read for Lzma2MtReader<R> {
                 DrainStatus::Progress => {}
                 DrainStatus::NeedsMoreInput => {
                     let t1 = std::time::Instant::now();
-                    let pumped = self.pump_input()?;
+                    let pumped = self.pump_input(self.backlog_wanted().max(1))?;
                     if let Some(t) = self.trace.as_mut() {
                         t.pump += t1.elapsed();
                     }
-                    if !pumped && self.input_done && direct == 0 && self.out.is_empty() {
+                    if !pumped && told_the_end && direct == 0 && self.out.is_empty() {
                         // End of the packed stream with no end marker: the
                         // stream is short, which is a corrupt archive rather
                         // than a decode that can continue.
