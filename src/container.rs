@@ -17,25 +17,115 @@ const MIB: u64 = 1024 * KIB;
 
 /// Limits a caller imposes on an archive *before* the reader allocates for it.
 ///
-/// Both fields default to "no limit", so [`ArchiveLimits::default`] reads like
-/// [`ArchiveReader::new`]. The point of the type is the two checks that have to
-/// happen before an allocation rather than after one:
+/// A 7z header is a list of numbers that describe an archive; nothing in the
+/// format makes those numbers true. A file of a few hundred bytes can say it
+/// has four billion entries, a 4 GiB dictionary, a header that unpacks to a
+/// terabyte, or a key derivation that wants 2^63 SHA-256 rounds. This type is
+/// the single place that says what this process is prepared to believe, and
+/// every field is checked *before* the allocation or the work it bounds, not
+/// after.
 ///
-/// - `max_end_header_bytes` bounds the declared size of the end header, which
-///   comes straight out of the first 32 bytes of the file. The reader buffers
-///   that many bytes in order to parse it, so an archive from an untrusted
-///   source can otherwise name any number it likes.
-/// - `memory_limit_bytes` bounds [`Archive::decoder_memory_estimate`], which
-///   is dominated by the LZMA/LZMA2 dictionary the block declares — again, a
-///   number out of the archive, allocated when the decoder is built.
+/// The defaults are chosen so that no archive a 7-Zip encoder would write
+/// trips them — an honest 1 GiB archive is nowhere near any of them — while a
+/// hostile one is refused with [`Error::LimitExceeded`], which names the bound
+/// it hit. The two "what can this machine afford" fields,
+/// `memory_limit_bytes` and `max_end_header_bytes`, keep defaulting to no
+/// limit at all: only the caller knows what it can afford, and guessing on its
+/// behalf would change what well-formed archives do.
 ///
-/// [`ArchiveReader::new`]: crate::ArchiveReader::new
+/// [`Error::LimitExceeded`]: crate::Error::LimitExceeded
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArchiveLimits {
     /// Largest decoder footprint the caller will allow, in bytes.
+    ///
+    /// Default: no limit. Bounds [`Archive::decoder_memory_estimate`], which
+    /// is dominated by the dictionary a block declares.
     pub memory_limit_bytes: u64,
     /// Largest end header the caller will allow to be buffered, in bytes.
+    ///
+    /// Default: no limit. The size comes out of the first 32 bytes of the
+    /// file and the reader must buffer that many bytes to parse it, so an
+    /// archive from an untrusted source can otherwise name any number.
     pub max_end_header_bytes: u64,
+    /// Largest header a *compressed* header may decode to, in bytes.
+    ///
+    /// Default: 64 MiB. An encoded header is a block like any other, so its
+    /// declared unpacked size is attacker-controlled and is buffered whole
+    /// before it can be parsed: a kilobyte of input can claim to unpack to a
+    /// terabyte. 64 MiB is two orders of magnitude above the largest header a
+    /// real archive has been seen to have (a million files with long names is
+    /// a few megabytes).
+    pub max_header_unpacked_bytes: u64,
+    /// How many times a header may be a compressed header containing another.
+    ///
+    /// Default: 2, which is one encoded header containing the real one — the
+    /// only nesting 7-Zip writes. Without a bound, a header that decodes to
+    /// another encoded header is an unbounded recursion driven by a few bytes
+    /// of input.
+    pub max_header_depth: u8,
+    /// Largest count of anything the header may declare: files, blocks,
+    /// coders, pack streams, sub-streams, bind pairs.
+    ///
+    /// Default: 1,000,000. Every count is also bounded by the bytes left in
+    /// the header — a thing that is described must be described by at least
+    /// one byte — but that bound has an amplification factor: a count is one
+    /// header byte and the entry it reserves is tens or hundreds of bytes, so
+    /// a 64 MiB header would otherwise be able to ask for gigabytes. The
+    /// largest archives seen in the wild have a few hundred thousand entries.
+    pub max_entries: u64,
+    /// Largest a single stored file name may be, in bytes of UTF-16.
+    ///
+    /// Default: 64 KiB, which is four times the longest path any mainstream
+    /// filesystem accepts.
+    pub max_name_bytes: u64,
+    /// Largest the whole names blob may be, in bytes.
+    ///
+    /// Default: 64 MiB, which is a million names of 64 characters.
+    pub max_total_name_bytes: u64,
+    /// Largest number of coders one block may chain.
+    ///
+    /// Default: 8. 7-Zip itself writes at most four (say AES over BCJ2 over
+    /// LZMA2), and the chain is walked recursively when the decode stack is
+    /// built.
+    pub max_coders_per_block: u64,
+    /// Largest number of coders in the archive, across every block.
+    ///
+    /// Default: 1,000,000, for the same reason as `max_entries`: a block is
+    /// cheap to declare and a coder is not.
+    pub max_total_coders: u64,
+    /// Largest total output the caller will accept from a decode, in bytes.
+    ///
+    /// Default: no limit. This is the decompression-bomb bound: the sizes are
+    /// in the header, so an archive whose declared output exceeds it is
+    /// refused before a byte is decoded, and a stream that lies about its size
+    /// is stopped when it passes the bound.
+    pub max_unpack_bytes: u64,
+    /// Largest ratio of output bytes to packed bytes the caller will accept.
+    ///
+    /// Default: no limit. LZMA legitimately reaches ratios in the thousands on
+    /// repetitive data, so this is off unless a caller knows what it is
+    /// feeding; `max_unpack_bytes` is the bound with a meaning that does not
+    /// depend on the data.
+    pub max_unpack_ratio: u64,
+    /// Largest AES key-derivation work factor the caller will accept.
+    ///
+    /// Default: 24, which is 16.7 million SHA-256 rounds and what 7-Zip itself
+    /// refuses to exceed. The field in the archive is six bits, so 63 is
+    /// expressible and would be 9.2 × 10^18 rounds from a header a caller
+    /// merely opened.
+    pub max_aes_cycles_power: u8,
+    /// Whether an entry whose stored name would escape the extraction
+    /// directory makes the archive unreadable.
+    ///
+    /// Default: false — the names are reported as they are stored, and
+    /// [`ArchiveEntry::is_unsafe_path`] says which ones are dangerous, because
+    /// a reader is not always a writer and a consumer listing an archive
+    /// should see what it actually contains. A consumer that extracts to a
+    /// directory should set this, and then no entry it is handed can contain
+    /// `..`, a root, a drive letter, a NUL or a backslash.
+    ///
+    /// [`ArchiveEntry::is_unsafe_path`]: crate::ArchiveEntry::is_unsafe_path
+    pub reject_unsafe_paths: bool,
 }
 
 impl Default for ArchiveLimits {
@@ -43,17 +133,30 @@ impl Default for ArchiveLimits {
         Self {
             memory_limit_bytes: u64::MAX,
             max_end_header_bytes: u64::MAX,
+            max_header_unpacked_bytes: 64 * MIB,
+            max_header_depth: 2,
+            max_entries: 1_000_000,
+            max_name_bytes: 64 * KIB,
+            max_total_name_bytes: 64 * MIB,
+            max_coders_per_block: 8,
+            max_total_coders: 1_000_000,
+            max_unpack_bytes: u64::MAX,
+            max_unpack_ratio: u64::MAX,
+            max_aes_cycles_power: 24,
+            reject_unsafe_paths: false,
         }
     }
 }
 
 impl ArchiveLimits {
-    /// Both limits at once.
+    /// Both of the caller-affordability limits at once, with every structural
+    /// limit left at its default.
     #[must_use]
     pub fn new(memory_limit_bytes: u64, max_end_header_bytes: u64) -> Self {
         Self {
             memory_limit_bytes,
             max_end_header_bytes,
+            ..Self::default()
         }
     }
 
@@ -63,6 +166,45 @@ impl ArchiveLimits {
         Self {
             memory_limit_bytes,
             ..Self::default()
+        }
+    }
+
+    /// Bounds the total decoded output, in bytes.
+    #[must_use]
+    pub fn with_max_unpack_bytes(mut self, bytes: u64) -> Self {
+        self.max_unpack_bytes = bytes;
+        self
+    }
+
+    /// Refuses entries whose stored names would escape an extraction
+    /// directory.
+    #[must_use]
+    pub fn rejecting_unsafe_paths(mut self) -> Self {
+        self.reject_unsafe_paths = true;
+        self
+    }
+
+    /// Every structural limit removed: counts, names, coders, nesting and the
+    /// key-derivation work factor are believed as the archive states them.
+    ///
+    /// For reading archives this process wrote itself. Nothing else should use
+    /// it, and nothing in this crate calls it.
+    #[must_use]
+    pub fn unlimited() -> Self {
+        Self {
+            memory_limit_bytes: u64::MAX,
+            max_end_header_bytes: u64::MAX,
+            max_header_unpacked_bytes: u64::MAX,
+            max_header_depth: u8::MAX,
+            max_entries: u64::MAX,
+            max_name_bytes: u64::MAX,
+            max_total_name_bytes: u64::MAX,
+            max_coders_per_block: u64::MAX,
+            max_total_coders: u64::MAX,
+            max_unpack_bytes: u64::MAX,
+            max_unpack_ratio: u64::MAX,
+            max_aes_cycles_power: 63,
+            reject_unsafe_paths: false,
         }
     }
 

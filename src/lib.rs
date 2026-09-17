@@ -98,7 +98,7 @@ pub use container::{
     UnsizedCoder, coder_memory_estimate, crc32_combine,
 };
 pub use encryption::Password;
-pub use error::{BlockErrorKind, Error};
+pub use error::{BlockErrorKind, Error, Limit};
 pub use reader::{ArchiveReader, BlockDecoder};
 pub use time::NtTime;
 #[cfg(all(feature = "compress", feature = "util", not(target_arch = "wasm32")))]

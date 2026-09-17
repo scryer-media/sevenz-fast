@@ -77,6 +77,23 @@ pub enum Error {
         /// What the archive's coders need, in bytes.
         required_bytes: u64,
     },
+    /// The archive asked for more than a limit in [`ArchiveLimits`] allows.
+    ///
+    /// Raised before the allocation or the work it bounds, so `requested` is
+    /// what the *archive declared*, not what was reached: nothing of that size
+    /// was allocated, decoded or derived. `what` names the bound, so a
+    /// consumer can tell "this archive wants more memory than we give it" from
+    /// "this archive claims four billion files".
+    ///
+    /// [`ArchiveLimits`]: crate::ArchiveLimits
+    LimitExceeded {
+        /// Which bound was hit.
+        what: Limit,
+        /// The limit in force, in the unit of `what`.
+        limit: u64,
+        /// What the archive declared, in the same unit.
+        requested: u64,
+    },
     /// A block failed to decode, with enough context to say which bytes.
     ///
     /// This is what separates "this archive is damaged, and here is where" from
@@ -96,6 +113,72 @@ pub enum Error {
         /// The underlying error, already rendered.
         message: String,
     },
+}
+
+/// Which bound an [`Error::LimitExceeded`] hit.
+///
+/// The field on [`ArchiveLimits`] of the same name documents what the bound is
+/// for and what the default is.
+///
+/// [`ArchiveLimits`]: crate::ArchiveLimits
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Limit {
+    /// `max_end_header_bytes`, in bytes.
+    EndHeaderBytes,
+    /// `max_header_unpacked_bytes`, in bytes.
+    HeaderUnpackedBytes,
+    /// `max_header_depth`, in levels of nesting.
+    HeaderDepth,
+    /// `max_entries`, in entries — of files, blocks, pack streams,
+    /// sub-streams, bind pairs or coders.
+    Entries,
+    /// `max_name_bytes`, in bytes of one stored name.
+    NameBytes,
+    /// `max_total_name_bytes`, in bytes of the whole names blob.
+    TotalNameBytes,
+    /// `max_coders_per_block`, in coders.
+    CodersPerBlock,
+    /// `max_total_coders`, in coders.
+    TotalCoders,
+    /// `memory_limit_bytes`, in bytes.
+    MemoryBytes,
+    /// `max_unpack_bytes`, in bytes.
+    UnpackBytes,
+    /// `max_unpack_ratio`, as output bytes per packed byte.
+    UnpackRatio,
+    /// `max_aes_cycles_power`, as the exponent itself.
+    AesCyclesPower,
+    /// The archive's own structure, rather than a caller's limit: a count,
+    /// size or offset that the bytes present cannot possibly support.
+    ///
+    /// `limit` is what the archive could support and `requested` what it
+    /// claimed.
+    ArchiveBytes,
+}
+
+impl Limit {
+    /// The name of the [`ArchiveLimits`] field, for messages.
+    ///
+    /// [`ArchiveLimits`]: crate::ArchiveLimits
+    #[must_use]
+    pub const fn field(self) -> &'static str {
+        match self {
+            Self::EndHeaderBytes => "max_end_header_bytes",
+            Self::HeaderUnpackedBytes => "max_header_unpacked_bytes",
+            Self::HeaderDepth => "max_header_depth",
+            Self::Entries => "max_entries",
+            Self::NameBytes => "max_name_bytes",
+            Self::TotalNameBytes => "max_total_name_bytes",
+            Self::CodersPerBlock => "max_coders_per_block",
+            Self::TotalCoders => "max_total_coders",
+            Self::MemoryBytes => "memory_limit_bytes",
+            Self::UnpackBytes => "max_unpack_bytes",
+            Self::UnpackRatio => "max_unpack_ratio",
+            Self::AesCyclesPower => "max_aes_cycles_power",
+            Self::ArchiveBytes => "the bytes the archive has",
+        }
+    }
 }
 
 /// What went wrong in an [`Error::BlockDecode`].
@@ -126,6 +209,33 @@ impl Error {
     #[inline]
     pub(crate) fn other<S: Into<Cow<'static, str>>>(s: S) -> Self {
         Self::Other(s.into())
+    }
+
+    /// A limit check that failed, before whatever it bounds was attempted.
+    #[inline]
+    pub(crate) fn limit(what: Limit, limit: u64, requested: u64) -> Self {
+        Self::LimitExceeded {
+            what,
+            limit,
+            requested,
+        }
+    }
+
+    /// Which bound this error reports, for any of the ways one is reported.
+    ///
+    /// [`Error::EndHeaderTooLarge`] and [`Error::MemoryLimited`] predate
+    /// [`Error::LimitExceeded`] and are still raised in their own shapes so
+    /// that existing consumers keep working; this maps all three onto the one
+    /// enum, so a consumer that only wants to say which limit stopped it does
+    /// not have to know which of them is older.
+    #[must_use]
+    pub fn limit_hit(&self) -> Option<Limit> {
+        match self {
+            Self::LimitExceeded { what, .. } => Some(*what),
+            Self::EndHeaderTooLarge { .. } => Some(Limit::EndHeaderBytes),
+            Self::MemoryLimited { .. } => Some(Limit::MemoryBytes),
+            _ => None,
+        }
     }
 
     #[inline]
