@@ -10,6 +10,8 @@ repository = "https://github.com/scryer-media/sevenz-fast"
 # Raised from upstream's 1.93: `lzma-fast` requires 1.97.1.
 rust-version = "1.97.1"
 version = "0.23.0"
+# Repository scaffolding that has no business in the crate archive.
+exclude = [".github/", ".githooks/", ".gitleaks.toml", ".gitattributes", "renovate.json", "AGENTS.md"]
 
 # `tools/decode-bench` is a workspace member rather than an example because it
 # depends on upstream `sevenz-rust2` to time the fork against it, and that
@@ -57,10 +59,11 @@ bzip2 = { version = "0.6", optional = true }
 cbc = { version = "0.2", optional = true }
 flate2 = { version = "1", optional = true, features = ["zlib-rs"] }
 getrandom = { version = "0.4", optional = true }
-# TEMPORARY: a path dependency while lzma-fast is unpublished. It becomes a
-# crates.io version pin before this crate is published — weaver's workspace
-# forbids `[patch.crates-io]`, so both crates are consumed published.
-lzma-fast = { path = "../lzma-fast/crates/lzma-fast", default-features = false, features = ["std", "asm", "crc"] }
+# The version is what is published; the path is the sibling checkout used
+# while the two crates are developed together, and is dropped for a release
+# (scripts/release.sh refuses to tag while it is here). Consumers get both
+# crates from crates.io.
+lzma-fast = { version = "0.3.0", path = "../lzma-fast/crates/lzma-fast", default-features = false, features = ["std", "asm", "crc"] }
 # Encoders only, behind `compress`. The decode path never reaches lzma-rust2;
 # see AGENTS.md.
 lzma-rust2 = { version = "0.20", default-features = false, features = ["std", "encoder", "optimization"], optional = true }

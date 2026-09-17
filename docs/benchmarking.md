@@ -107,14 +107,14 @@ identically to `7zz` and to upstream, not only to this crate.
 
 | Decoder | Unpinned | MiB/s | Pinned (P-cores) | MiB/s |
 | --- | --- | --- | --- | --- |
-| `7zz t` (all threads) | 3.864 s | 265.0 | 4.178 s | 245.1 |
-| `7zz t -mmt=1` | 20.129 s | 50.9 | 19.999 s | 51.2 |
-| `sevenz-rust2` 0.22.2 | 25.433 s | 40.3 | 28.807 s | 35.5 |
-| `sevenz-fast` @1 | 19.999 s | 51.2 | 19.931 s | 51.4 |
+| `7zz t` (all threads) | 3.860 s | 265.3 | 4.217 s | 242.8 |
+| `7zz t -mmt=1` | 20.166 s | 50.8 | 20.085 s | 51.0 |
+| `sevenz-rust2` 0.22.2 | 25.629 s | 40.0 | 28.862 s | 35.5 |
+| `sevenz-fast` @1 | 19.899 s | 51.5 | 19.882 s | 51.5 |
 | `sevenz-fast` @2 | 11.439 s | 89.5 | 11.394 s | 89.9 |
-| `sevenz-fast` @8 | 4.815 s | 212.7 | 5.175 s | 197.9 |
-| **`sevenz-fast` @16** | **4.794 s** | **213.6** | — | — |
-| `sevenz-fast` @16, no CRC | 4.781 s | 214.2 | 5.134 s (@8) | 199.5 |
+| `sevenz-fast` @8 | 4.587 s | 223.2 | 5.057 s | 202.5 |
+| **`sevenz-fast` @16** | **4.599 s** | **222.6** | — | — |
+| `sevenz-fast` @16, no CRC | 4.596 s | 222.8 | 4.965 s (@8) | 206.2 |
 
 #### `st.7z` (897.3 MiB packed, one single-threaded LZMA2 stream)
 
@@ -142,13 +142,15 @@ this fixture either.
 At the decoder's own boundary this crate matches that at every thread count —
 10.77 / 6.65 / 4.05 / 4.12 s at 2 / 4 / 8 / 16 threads, measured with
 `SEVENZ_FAST_MT_TRACE=1`, which is within ~2% of bare. The end-to-end lane
-above was ~0.7 s slower at eight threads when it was measured: the reader
-drained everything the decoder had ready, spilled what did not fit the
-caller's buffer, and copied it a second time on the way out. The reader now
-asks for no more than the caller's buffer holds (`drain_upto`, lzma-fast
-0.3.0), so what remains of the gap is the harness's own digest of 1 GiB. The
-table above predates that change; the x86-box rows have not been re-run
-since.
+above was 0.7 s slower at eight threads when first measured. Most of what
+the reader did with each block then was copy it: it drained everything the
+decoder had ready, spilled what did not fit the caller's buffer, and copied
+that a second time on the way out. The reader now asks for no more than the
+caller's buffer holds (`drain_upto`, lzma-fast 0.3.0), which took the row
+from 4.815 s to 4.587 s unpinned and 5.175 s to 5.057 s pinned; the table
+above is the re-measured one (the @2 rows are from the earlier run). What
+remains of the gap is the harness's digest of 1 GiB and the in-order copy
+into the caller's buffer, which `7zz t` does not do.
 
 #### What parallel decoding costs in memory
 

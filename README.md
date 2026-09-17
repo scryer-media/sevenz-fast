@@ -151,6 +151,25 @@ and asking for `aes256` with neither is a compile error rather than a silent
 choice about what cryptography is in your binary. `sevenz_fast::crypto_backend()`
 reports which one a build selected.
 
+## Speed
+
+Two 7z archives of the same 1 GiB, decoded and CRC-checked in full, on
+Linux x86_64 (Intel Arrow Lake-H, 16 threads), median of three runs.
+`mt.7z` was written by `7zz -mmt=on`, so its LZMA2 stream can be decoded in
+parallel; `st.7z` by `7zz -mmt=1`, so it cannot, by anyone.
+
+| decoder | `mt.7z` | `st.7z` |
+| --- | --- | --- |
+| `7zz t`, all threads | 3.86 s | 20.1 s |
+| `7zz t -mmt=1` | 20.2 s | 20.2 s |
+| `sevenz-rust2` 0.22.2 | 25.6 s | 28.7 s |
+| `sevenz-fast`, 1 thread | 19.9 s | 20.0 s |
+| `sevenz-fast`, 8 threads | 4.59 s | 20.0 s |
+
+On an Apple M5 Max the same `mt.7z` takes 2.28 s at 8 threads against
+2.13 s for `7zz`. Encrypted archives, more machines and what each phase of
+a decode costs are in [docs/benchmarking.md](docs/benchmarking.md).
+
 ## Usage
 
 ```toml
@@ -273,6 +292,31 @@ build for `wasm32`, so the WASM feature set uses the RustCrypto backend.
 ```bash
 RUSTFLAGS='--cfg getrandom_backend="wasm_js"' cargo build --target wasm32-unknown-unknown --no-default-features --features=default_wasm
 ```
+
+## Acknowledgements
+
+Almost none of this crate is ours, and the people it belongs to should be
+named before the licence is.
+
+- **Nils Hasenbanck** wrote and maintains
+  [`sevenz-rust2`](https://github.com/hasenbanck/sevenz-rust2), which is the
+  code in this repository: the archive reader and writer, the coders, the
+  encryption, the tests and the examples. He also wrote
+  [`lzma-rust2`](https://github.com/hasenbanck/lzma-rust2), whose BCJ, BCJ2
+  and delta filters are vendored here unchanged and whose encoders this crate
+  still uses to write archives. This fork is his work with two changes bolted
+  on, and if you are not sure you need those changes, his crate is the one to
+  use.
+- **dyz1990** wrote the original
+  [`sevenz-rust`](https://github.com/dyz1990/sevenz-rust) that `sevenz-rust2`
+  continued, and with it the first 7z implementation in pure Rust.
+- **Igor Pavlov** designed the 7z format, LZMA and LZMA2, and wrote
+  [7-Zip](https://www.7-zip.org/), whose public-domain decoders are what
+  [`lzma-fast`](https://github.com/scryer-media/lzma-fast) ports and whose
+  `7zz` is the oracle every differential test in this crate is checked
+  against.
+- Everyone in [CONTRIBUTORS.md](CONTRIBUTORS.md), which lists the upstream
+  authors by name.
 
 ## Licence
 
