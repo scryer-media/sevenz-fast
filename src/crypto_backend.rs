@@ -66,7 +66,8 @@ compile_error!(
      (the default, AWS-LC) or `native-crypto` (RustCrypto, no C toolchain)"
 );
 
-/// Which SHA-256 backend this build selected. Only used by tests and
+/// Which cryptography backend this build selected, for SHA-256 and for
+/// AES-256-CBC alike. Only used by tests and
 /// diagnostics, but a consumer wondering what is in their binary should be
 /// able to ask.
 pub(crate) const BACKEND: &str = if cfg!(feature = "native-crypto") {

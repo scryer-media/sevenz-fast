@@ -251,32 +251,43 @@ Everything here is new surface; no upstream signature changed meaning.
 
 ### Cryptography
 
-- SHA-256 for the `aes256` coder comes from `lzma-fast`'s crypto module behind
-  one internal backend module, `src/crypto_backend.rs`. The default backend is
+- Cryptography for the `aes256` coder — SHA-256 *and* AES-256-CBC — goes
+  through one internal backend module, `src/crypto_backend.rs`. SHA-256 comes
+  from `lzma-fast`'s crypto module. The default backend is
   `aws-lc-rs` (feature `aws-lc-crypto`, in `default`), the scryer-media house
   convention shared with `lzma-fast` and `rarpar`; `native-crypto` selects
   RustCrypto's `sha2` and **takes precedence** when both are compiled, so a
   consumer who cannot build C uses `default-features = false` plus
   `native-crypto`.
-- **AES-256-CBC is this crate's own**, on both lanes, over RustCrypto's
-  `aes`/`cbc` in `src/crypto_backend.rs`. `lzma-fast` removed AES and the 7z
-  key derivation deliberately — 7z cryptography is this crate's job — and
-  RustCrypto is the only backend with a streaming CBC API, which is what a
-  reader taking the packed stream in whatever pieces arrive needs; it compiles
-  to AES-NI on x86-64 and to the ARMv8 cryptography extensions on aarch64.
-  The backend feature therefore selects SHA-256 and nothing else.
+- **AES-256-CBC is this crate's own code, but not its own backend.** `lzma-fast`
+  removed AES and the 7z key derivation deliberately — 7z cryptography is this
+  crate's job — so the cipher lives in `src/crypto_backend.rs`, and it follows
+  the same feature switch SHA-256 does: `aws_lc_rs::cipher::DecryptingKey::cbc`
+  (AWS-LC's unpadded CBC mode, no PKCS7 — `StreamingDecryptingKey` is the padded
+  one and is not used) on the default lane, RustCrypto's `aes`/`cbc` on
+  `native-crypto`, which compiles to AES-NI on x86-64 and to the ARMv8
+  cryptography extensions on aarch64. Neither lane needs a streaming API: a
+  chunk is decrypted with the current IV and that chunk's last ciphertext
+  block, copied out before the in-place decrypt, is the next chunk's IV. The
+  encoder (`compress`) keeps RustCrypto's `cbc::Encryptor`.
+  `aws-lc-rs` is a direct optional dependency on the pin and features
+  `lzma-fast` uses, so a build with both crates resolves one copy of AWS-LC.
 - `aes256` no longer implies a backend: enabling it with neither
   `aws-lc-crypto` nor `native-crypto` is a compile error. A consumer migrating
   from upstream with `default-features = false, features = ["aes256", …]` adds
   `"aws-lc-crypto"` to that list.
 - New `sevenz_fast::crypto_backend() -> &'static str`, reporting which backend
   a build selected, for consumers who want to assert on it.
-- The `aes` and `cbc` dependencies are enabled by `aes256` (decryption) and by
-  `compress` (encryption). The direct `sha2` dependency is gone.
+- The `aes` and `cbc` dependencies are enabled by `native-crypto` (decryption)
+  and by `compress` (encryption); the AWS-LC lane does not compile them. The
+  direct `sha2` dependency is gone.
 - When both backends are compiled, a differential test checks they agree on
-  SHA-256 and on the 7z key derivation; AES-256-CBC is checked against NIST
-  SP 800-38A F.2.6, block by block as well as in one call, and SHA-256 against
-  its own vectors. `7zAes.c`'s two special cycle counts (`0x3F`, `>= 0x40`) have tests of
+  SHA-256, on the 7z key derivation and on AES-256-CBC — the NIST SP 800-38A
+  F.2.6 vector on each lane, whole-buffer equality at several sizes, chunked
+  chaining at 1/2/3/5/13 blocks per call against the one-shot result, empty
+  calls and the partial-block refusal. The selected lane is also checked
+  against NIST on its own, block by block as well as in one call, and SHA-256
+  against its own vectors. `7zAes.c`'s two special cycle counts (`0x3F`, `>= 0x40`) have tests of
   their own.
 
 ### Testing

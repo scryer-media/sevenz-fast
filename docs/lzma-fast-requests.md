@@ -73,12 +73,14 @@ LZMA, LZMA2 and the xz container. Both requests are therefore withdrawn, not
 outstanding.
 
 What this crate does instead, in `src/crypto_backend.rs`: AES-256-CBC is
-RustCrypto's `aes`/`cbc` on both lanes (it is the only backend with a streaming
-CBC API, and it compiles to AES-NI and to the ARMv8 cryptography extensions),
-and the backend feature now selects SHA-256 only — `lzma_fast::crypto::awslc`
-or `lzma_fast::crypto::rustcrypto`. The 7z derivation runs over a local
-`Sha256Like` trait implemented for both, which is what makes the cross-backend
-differential test possible.
+written here and follows the same backend feature SHA-256 does —
+`aws_lc_rs::cipher::DecryptingKey::cbc` (AWS-LC's unpadded CBC mode) by
+default, RustCrypto's `aes`/`cbc` under `native-crypto` — while SHA-256 comes
+from `lzma_fast::crypto::awslc` or `lzma_fast::crypto::rustcrypto`. Neither
+lane needs a streaming CBC API: each chunk is decrypted with the current IV and
+its last ciphertext block becomes the next chunk's. The 7z derivation runs over
+a local `Sha256Like` trait, and the cipher over an `Aes256CbcLike` one, which
+is what makes the cross-backend differential tests possible.
 
 ### Worker-side checksums — landed, and this fork folds them
 

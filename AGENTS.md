@@ -63,9 +63,10 @@ differential matrix in `docs/benchmarking.md`.
 - The BCJ, BCJ2 and delta filters are vendored from `lzma-rust2` (Apache-2.0,
   see `src/codec/filter/mod.rs`) so the crate does not carry `lzma-rust2` at
   runtime. Fixes to them belong upstream in `lzma-rust2` as well as here.
-- Crypto goes through `src/crypto_backend.rs`: `aws-lc-rs` by default,
-  RustCrypto when the `native-crypto` feature is on. Never call a backend
-  crate directly from anywhere else.
+- Crypto goes through `src/crypto_backend.rs` — SHA-256 *and* AES-256-CBC:
+  `aws-lc-rs` by default, RustCrypto when the `native-crypto` feature is on.
+  Never call a backend crate directly from anywhere else. The one exception is
+  the encoder's `cbc::Encryptor` in `src/encryption/aes.rs`, behind `compress`.
 - CRC-32 is `crc-fast` (via `lzma-fast`'s `crc` module), never `crc32fast`.
 - **No CRC-32 is computed in a serialised section of the multi-threaded path.**
   Checksumming is O(bytes) and the in-order section is the one place where the

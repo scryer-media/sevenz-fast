@@ -133,14 +133,16 @@ upstream.
 
 ### Crypto backends
 
-The 7z `aes256` coder needs AES-256-CBC and SHA-256. The **SHA-256** backend is
-`aws-lc-rs` by default; enabling `native-crypto` switches to RustCrypto's
-`sha2` and takes precedence, so a consumer that cannot build C can use
-`default-features = false` with `aes256, native-crypto`. **AES-256-CBC is not
-part of that choice**: it is RustCrypto's `aes`/`cbc` on both lanes, which is
-the only backend with a streaming CBC API and which compiles to AES-NI on
-x86-64 and to the ARMv8 cryptography extensions on aarch64. CRC-32 is
-`crc-fast`.
+The 7z `aes256` coder needs AES-256-CBC and SHA-256, and **both** follow the
+backend feature. The default is `aws-lc-rs` — `DecryptingKey::cbc`, AWS-LC's
+unpadded CBC mode, plus its SHA-256. Enabling `native-crypto` switches both to
+RustCrypto (`aes`/`cbc` and `sha2`) and takes precedence, so a consumer that
+cannot build C can use `default-features = false` with `aes256, native-crypto`;
+that lane compiles to AES-NI on x86-64 and to the ARMv8 cryptography extensions
+on aarch64. Decrypting a 7z stream in pieces needs no streaming API on either
+lane: each chunk is decrypted with the current IV and its last ciphertext block
+becomes the next chunk's. Writing archives (`compress`) keeps RustCrypto's
+`cbc::Encryptor`. CRC-32 is `crc-fast`.
 
 Because Cargo features are additive, `native-crypto` cannot mean "turn AWS-LC
 off"; it means "win when both are compiled". So `aes256` does not pull a
