@@ -91,7 +91,7 @@ two, eight and all threads — is a property of the machine's cores as much as o
 the code. Both fixtures are 1024.0 MiB of output; every figure is the median of
 three runs with the box otherwise idle.
 
-### linux-x86_64 (x86-box)
+### linux-x86_64
 
 12th Gen Intel Core i5-1240P: 4 performance cores with SMT (CPUs 0-7) and 8
 efficiency cores (CPUs 8-15), 16 CPUs in total, no AVX-512. 61 GiB RAM,
@@ -201,7 +201,7 @@ already in memory, in 1 MiB chunks with the IV carried between them, calling
 `aws-lc-rs` directly; `--floor` reads the archive file in 1 MiB chunks and
 optionally digests it, which is the floor no lane can beat; `--io-profile`
 reports the read-size histogram of one decode; and the `no crc` lane prices
-the checksum. On x86-box, pinned:
+the checksum. On linux-x86_64, pinned:
 
 | Layer | 1 GiB |
 | --- | --- |
@@ -304,7 +304,7 @@ The two backends are level on this architecture — AWS-LC's arm64 AES and
 RustCrypto's are within 2% of each other, and `--cipher-only` puts the cipher
 itself at 14.8 GiB/s. The store fixture splits as 0.067 s of cipher, 0.046 s of
 file read, 0.040 s of the bench's own digest and 0.009 s of CRC-32, against a
-0.175 s lane: the same accounting as x86-box, on a machine roughly twice as
+0.175 s lane: the same accounting as linux-x86_64, on a machine roughly twice as
 fast. The `-mx1` fixture is LZMA2-bound and `7zz` spends all 18 cores on it
 while our parallel path is capped by the archive's chunking.
 

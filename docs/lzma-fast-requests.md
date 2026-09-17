@@ -131,74 +131,31 @@ pending:
 - a block decoded single-threaded, where the consuming thread *is* the
   decoding thread and there is no serialised section to keep clear.
 
+### A drain that stops when the caller's buffer is full — landed, and this fork is on it
+
+`Lzma2AdaptiveDecoder::drain_upto(limit, sink)` (lzma-fast 0.3.0) hands the
+sink no more than `limit` bytes and keeps the rest of the block for the next
+call. The parallel reader here asks for exactly what the caller's buffer
+holds, so a block out of the parallel path — a whole run, 128 MiB for an
+archive written by `7zz -mmt=on` — is no longer decoded into a spill buffer
+and copied out of it again. On x86 at eight threads that took a gigabyte from
+4.82 s to 4.59 s; the spill path stays in the reader as a safety net that is
+never taken.
+
+### A chase decoder that stands aside while a worker is free — landed, not yet taken up
+
+`Lzma2AdaptiveDecoder::set_chase(false)` (lzma-fast 0.3.0) makes the
+decoder wait for a worker instead of decoding the run at its cursor on the
+calling thread when that run's chunk header has not arrived. That was the
+request: for a stream already on disk, chasing happened once per batch of fed
+bytes and cost, at two threads, as long as the two workers spent on the other
+two runs. This fork still uses its own work-around — it walks the chunk
+headers itself (`Lzma2RunScanner`) and feeds only whole runs, sized so the
+one run the chase does take is overlapped by several rounds of worker work —
+which costs a gigabyte of read-ahead to hide the chase. Switching the reader
+to `set_chase(false)` and a smaller batch is the open item.
+
 ## Outstanding
-
-### A chase decoder that stands aside while a worker is free
-
-`Lzma2AdaptiveDecoder::drain` gives the run at its cursor to the chase decoder
-— the single-threaded one, on the caller's thread — whenever `dispatch` finds
-no *complete* run there, and a run is complete only once the chunk header that
-follows it has arrived. It then keeps that run to the end: `st_in_run` turns
-dispatch off until the chase is through.
-
-That is right for the case it was built for, a stream still arriving. It is
-wrong for a stream already on disk, where it happens once per batch of fed
-bytes and is not a small cost: the chase decodes in 1 MiB steps and no worker
-may start a run while it runs, so at two threads a batch of two runs spent as
-long chasing the third as the two workers spent on the other two. Measured on
-`mt.7z`, 8 runs of 128 MiB: 15.9 s against 10.6 s for the same decoder's own
-parallel path, 1.50x, with half the output produced in 1 MiB steps.
-
-```rust
-impl Lzma2AdaptiveDecoder {
-    /// Whether the run at the cursor may be decoded on the calling thread when
-    /// no worker can take it yet. On by default, which is the arriving-stream
-    /// case; off for a caller that would rather wait than serialise.
-    pub fn set_chase(&mut self, chase: bool);
-}
-```
-
-Or, without a knob at all: return `Dispatch::Busy` rather than `None` when
-`outstanding != 0` and there is no complete run at the cursor. A worker is
-already running; there is something to wait for; waiting is what `drain`
-already does everywhere else.
-
-**Work-around until then.** This crate walks the chunk headers itself
-(`Lzma2RunScanner`, which is public — thank you) and feeds only whole runs, so
-the chase is never handed a run whose bytes are still coming in this reader's
-buffer; and the batch is sized so that the one run the chase does take at the
-end of it is overlapped by several rounds of worker work rather than being a
-third of the batch. That costs a gigabyte of read-ahead, and about two of peak
-memory, to hide something that would otherwise cost nothing at all.
-
-### A drain that stops when the caller's buffer is full
-
-`Lzma2AdaptiveDecoder::drain` decodes everything the bytes fed so far allow and
-hands each block to a sink as `(offset, &[u8])`. A 7z coder is a `Read`: it is
-asked for as much as fits in a caller's buffer, which is typically 64 KiB to a
-few MiB, while a block out of the parallel path is a whole run — 128 MiB for an
-archive written by `7zz -mmt=on`. So every byte is copied once into a spill
-buffer here and once out of it again, and the spill buffer grows to the size of
-everything fed.
-
-```rust
-impl Lzma2AdaptiveDecoder {
-    /// As `drain`, but stops once `sink` has been handed `limit` bytes,
-    /// keeping the rest for the next call.
-    pub fn drain_upto<F>(&mut self, limit: usize, sink: F) -> Result<DrainStatus, Error>;
-}
-```
-
-That would let this crate hand the decoder the caller's own buffer and copy
-nothing. It would also make the *memory* of a parallel decode a function of
-what is in flight rather than of what has been fed.
-
-**Work-around until then.** What fits in the caller's buffer is copied into it
-directly from the sink and only the overflow is buffered, and the feed is
-capped so that a single `drain` cannot decode an entire archive into memory —
-though the cap has to stay large for the reason in the previous request, so the
-spill is measured in hundreds of megabytes rather than in the tens it should
-be.
 
 ### A run index over a stream this crate has not started decoding
 
