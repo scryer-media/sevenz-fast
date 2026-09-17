@@ -1,12 +1,13 @@
 # Publishing
 
-Releases are cut with `scripts/release.sh` and published by
-`.github/workflows/release.yml`. The script runs every check the workflow
+Releases are cut with `cargo xtask release` and published by
+`.github/workflows/release.yml`. The task (`xtask/src/main.rs`, plain Rust
+with no dependencies, so it runs wherever `cargo` does) runs every check the workflow
 runs, so a tag that reaches GitHub is one the workflow will accept.
 
 `sevenz-fast` is published after the `lzma-fast` version it pins, never
 before: the manifest reaches `lzma-fast` through crates.io, and the release
-script refuses to tag while a `path` is still on that dependency.
+task refuses to tag while a `path` is still on that dependency.
 
 ## One-time setup, before the first release
 
@@ -15,7 +16,7 @@ script refuses to tag while a `path` is still on that dependency.
    first release is cut with
 
    ```sh
-   scripts/release.sh --publish
+   cargo xtask release --publish
    ```
 
    which runs the checks, creates the signed tag, runs `cargo publish` and
@@ -46,7 +47,7 @@ which it requests for that job only.
      unreleased (the `## Fork` section stays where it is; it is the rebase
      checklist, not a release note);
    - commit, signed.
-3. `scripts/release.sh --dry-run`, then `scripts/release.sh`. The dry run
+3. `cargo xtask release --dry-run`, then `cargo xtask release`. The dry run
    works on any branch and on a dirty tree, and lists everything a real run
    would refuse rather than stopping at the first. A real run refuses a dirty
    tree, an unsigned HEAD, a branch other than `main`, a changelog section

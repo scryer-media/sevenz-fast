@@ -11,13 +11,13 @@ repository = "https://github.com/scryer-media/sevenz-fast"
 rust-version = "1.97.1"
 version = "0.23.0"
 # Repository scaffolding that has no business in the crate archive.
-exclude = [".github/", ".githooks/", ".gitleaks.toml", ".gitattributes", "renovate.json", "AGENTS.md"]
+exclude = [".github/", ".githooks/", ".gitleaks.toml", ".gitattributes", "renovate.json", "AGENTS.md", ".cargo/", "xtask/", "rust-toolchain.toml"]
 
 # `tools/decode-bench` is a workspace member rather than an example because it
 # depends on upstream `sevenz-rust2` to time the fork against it, and that
 # dependency must not appear in this crate's own graph at all.
 [workspace]
-members = ["tools/decode-bench"]
+members = ["tools/decode-bench", "xtask"]
 resolver = "3"
 
 [lib]
@@ -61,7 +61,7 @@ flate2 = { version = "1", optional = true, features = ["zlib-rs"] }
 getrandom = { version = "0.4", optional = true }
 # The version is what is published; the path is the sibling checkout used
 # while the two crates are developed together, and is dropped for a release
-# (scripts/release.sh refuses to tag while it is here). Consumers get both
+# (`cargo xtask release` refuses to tag while it is here). Consumers get both
 # crates from crates.io.
 lzma-fast = { version = "0.3.0", path = "../lzma-fast", default-features = false, features = ["std", "asm", "crc"] }
 # Encoders only, behind `compress`. The decode path never reaches lzma-rust2;

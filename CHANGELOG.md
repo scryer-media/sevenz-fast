@@ -14,7 +14,7 @@ against. Upstream's own changelog continues below, unchanged.
 
 ### Packaging
 
-- Released with `scripts/release.sh` and `.github/workflows/release.yml`
+- Released with `cargo xtask release` and `.github/workflows/release.yml`
   (crates.io trusted publishing on a signed `v<version>` tag); see
   `docs/publishing.md`. The crate archive no longer carries the repository's
   CI, hook and agent files.
