@@ -167,8 +167,23 @@ parallel; `st.7z` by `7zz -mmt=1`, so it cannot, by anyone.
 | `sevenz-fast`, 8 threads | 4.59 s | 20.0 s |
 
 On an Apple M5 Max the same `mt.7z` takes 2.28 s at 8 threads against
-2.13 s for `7zz`. Encrypted archives, more machines and what each phase of
-a decode costs are in [docs/benchmarking.md](docs/benchmarking.md).
+2.13 s for `7zz`.
+
+Encrypted archives are where the fork is clearly ahead. The same 1 GiB,
+stored (`-mx0`) and AES-256 encrypted, so that decrypting it is nearly all
+of the work:
+
+| `aes_store.7z` | `sevenz-fast` | `7zz t` | `sevenz-rust2` |
+| --- | --- | --- | --- |
+| Linux x86_64 | 0.28 s | 0.63 s | 0.94 s |
+| Windows x86_64 | 0.48 s | 0.65 s | 3.46 s |
+| macOS arm64 | 0.18 s | 0.23 s | 0.97 s |
+
+The AES decoder reads the packed stream a megabyte at a time and decrypts
+it in the caller's buffer; measured layer by layer, the cipher, the file read
+and the CRC add up to the whole decode, with nothing left in the plumbing.
+What each phase of a decode costs, and the rest of the fixtures, are in
+[docs/benchmarking.md](docs/benchmarking.md).
 
 ## Usage
 
