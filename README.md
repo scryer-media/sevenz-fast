@@ -3,7 +3,6 @@
 [![ci](https://github.com/scryer-media/sevenz-fast/actions/workflows/ci.yml/badge.svg)](https://github.com/scryer-media/sevenz-fast/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/sevenz-fast.svg)](https://crates.io/crates/sevenz-fast)
 [![docs.rs](https://docs.rs/sevenz-fast/badge.svg)](https://docs.rs/sevenz-fast)
-[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/scryer-media/sevenz-fast/badge)](https://securityscorecards.dev/viewer/?uri=github.com/scryer-media/sevenz-fast)
 
 A 7z compressor/decompressor in pure Rust.
 
