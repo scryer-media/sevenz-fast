@@ -109,18 +109,74 @@ against. Upstream's own changelog continues below, unchanged.
 - The LZMA coder's properties are length-checked before being sliced, instead
   of panicking on a short field.
 
+### Safety against hostile archives
+
+Upstream trusts the numbers in a 7z header. This fork bounds every one of them
+before the allocation or the work it sizes, against both the bytes the archive
+actually has and the caller's `ArchiveLimits`. The model, the table of limits
+and the audit are in `docs/security.md`; in summary:
+
+- Header counts — files, blocks, coders, pack streams, sub-streams, bind pairs
+  — no longer reserve on a claim. Neither does a name, a names blob, a coder
+  properties field or a compressed header's declared unpacked size.
+- A compressed header that decodes to another one is refused rather than
+  followed, and a coder graph is validated before anything is built from it:
+  indices in range, no stream bound or packed twice, exactly one unbound
+  output, and no cycle.
+- A coder's stream counts are bounded (`max_streams_per_coder`), which is what
+  makes the graph's linear searches constant work instead of quadratic.
+- Pack streams must end inside the file, so a header cannot aim a decode at an
+  arbitrary offset.
+- LZMA and LZMA2 dictionaries are clamped to the coder's declared unpacked
+  size, the way 7-Zip reduces them: a 4 GiB dictionary on a 1 KiB stream is
+  memory that would be allocated and never read. An archive that upstream
+  would refuse for its budget can now decode.
+- zstd's declared window is bounded by the caller's budget, and otherwise by
+  the 128 MiB the reference decoder itself will not exceed.
+- The AES key-derivation work factor is the caller's `max_aes_cycles_power`,
+  never above 24 — the header field is six bits, so 2^63 rounds is otherwise
+  expressible from a file a caller merely opened.
+- The declared output and output-to-packed ratio can be bounded
+  (`max_unpack_bytes`, `max_unpack_ratio`), refusing a bomb before a byte is
+  decoded.
+- Entry names are reported as unsafe (`ArchiveEntry::is_unsafe_path`) or
+  refused outright (`ArchiveLimits::reject_unsafe_paths`), and symlink entries
+  are surfaced rather than silently written as small text files.
+- `fuzz/` has libFuzzer targets on the header parser and the coder graph,
+  running under a counting allocator that fails a run that allocates more than
+  the limits allow.
+
+None of this changes what a well-formed archive does: the defaults are one to
+two orders of magnitude above the largest legitimate values, and the
+differential matrix against `7zz` stays green.
+
 ### Container API (additions only)
 
 Everything here is new surface; no upstream signature changed meaning.
 
-- `ArchiveLimits { memory_limit_bytes, max_end_header_bytes }`, with
-  `ArchiveReader::with_limits`, `Archive::read_with_limits` and
-  `BlockDecoder::with_limits`. Both limits are checked *before* the allocation
-  they bound: the declared end-header size before the header is buffered
-  (`Error::EndHeaderTooLarge`), and `Archive::decoder_memory_estimate` before
-  any decoder is built (`Error::MemoryLimited`). The memory limit then bounds
-  each coder as it is constructed, replacing the crate's own effectively
-  unlimited constant.
+- `ArchiveLimits`, with `ArchiveReader::with_limits`,
+  `Archive::read_with_limits` and `BlockDecoder::with_limits`: one model for
+  what an archive is allowed to claim, checked *before* the allocation or the
+  work it bounds. Two affordability limits — `memory_limit_bytes` (bounding
+  `Archive::decoder_memory_estimate` and then each coder as it is built) and
+  `max_end_header_bytes` (before the header is buffered) — and the structural
+  bounds `max_header_unpacked_bytes`, `max_header_depth`, `max_entries`,
+  `max_name_bytes`, `max_total_name_bytes`, `max_coders_per_block`,
+  `max_streams_per_coder`, `max_total_coders`, `max_unpack_bytes`,
+  `max_unpack_ratio`, `max_aes_cycles_power` and `reject_unsafe_paths`. Every
+  field documents the attack it closes and defaults to a value no legitimate
+  archive reaches; `ArchiveLimits::unlimited()` removes the structural ones for
+  a caller reading archives it wrote itself. `docs/security.md` is the table.
+- `Error::LimitExceeded { what: Limit, limit, requested }`, so a consumer can
+  report which bound stopped a read rather than "corrupt archive", with
+  `Limit::field()` naming the `ArchiveLimits` field and `Error::limit_hit()`
+  mapping every way a limit is reported — including `EndHeaderTooLarge` and
+  `MemoryLimited`, which predate it — onto the one enum.
+- `ArchiveEntry::is_unsafe_path()` / `unsafe_path_reason()`, `is_symlink()`
+  and `unix_mode()`: whether a stored name would escape an extraction
+  directory and which way, and whether the entry is a link whose content is a
+  target rather than a file. `Error::UnsafeEntryName` is what
+  `reject_unsafe_paths` raises.
 - `Archive::decoder_memory_estimate() -> Result<u64, UnsizedCoder>` and
   `coder_memory_estimate(&Coder)`: what a single-threaded decode of the archive
   needs, as the largest block's coder chain. The per-coder table is in the

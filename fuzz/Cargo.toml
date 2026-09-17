@@ -1,0 +1,38 @@
+# Fuzz targets for the header parser and the coder graph.
+#
+# Its own workspace: a fuzz build is a nightly, sanitiser-instrumented build of
+# the crate, and it must not pull the real workspace's members (the bench tool,
+# its oracles) into that.
+[package]
+name = "sevenz-fast-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.sevenz-fast]
+path = ".."
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "header"
+path = "fuzz_targets/header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "folder_graph"
+path = "fuzz_targets/folder_graph.rs"
+test = false
+doc = false
+bench = false

@@ -168,6 +168,31 @@ sevenz_fast::decompress_file("data/sample.7z", "data/sample").expect("complete")
 sevenz_fast::decompress_file_with_password("path/to/encrypted.7z", "data/sample", "password".into()).expect("complete");
 ```
 
+### Archives from strangers
+
+Every number in a 7z header is chosen by whoever wrote the file, and this crate
+bounds each one before the allocation or the work it sizes — counts, names,
+dictionaries, nesting, the key-derivation factor, the declared output. The
+defaults are in force whether or not a caller passes limits, and no archive a
+mainstream 7-Zip writes reaches them.
+
+```rust
+use sevenz_fast::{ArchiveLimits, ArchiveReader, Password};
+
+let limits = ArchiveLimits::memory(512 << 20)   // what a decode may allocate
+    .with_max_unpack_bytes(8 << 30)             // refuse a bomb at open
+    .rejecting_unsafe_paths();                  // and a name that would escape
+let reader = ArchiveReader::with_limits(file, Password::empty(), limits)?;
+```
+
+`Error::LimitExceeded { what, limit, requested }` says which bound stopped a
+read, so a consumer can report "this archive wants more memory than we give it"
+rather than "corrupt archive". Per entry, `ArchiveEntry::is_unsafe_path()` and
+`is_symlink()` say what a name would do before anything is written.
+
+[`docs/security.md`](docs/security.md) is the threat model, every limit with its
+default and rationale, and what happens when each is hit.
+
 ## Compression
 
 ```rust

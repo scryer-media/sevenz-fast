@@ -99,6 +99,23 @@ differential matrix in `docs/benchmarking.md`.
   split — how much was chased, how long was spent feeding, how long draining —
   and is how that is checked.
 
+## Reading hostile archives
+
+- **No allocation and no unit of work is sized by a header field without a
+  limit check first.** Every number in a 7z header is attacker-chosen. Before
+  anything is reserved, walked, decoded or derived from one, it is bounded by
+  the bytes the archive actually has *and* by the relevant [`ArchiveLimits`]
+  field — a count is one byte and the entry it reserves is a hundred, so the
+  byte bound alone is not enough. `Vec::with_capacity(claimed)` and
+  `vec![x; claimed]` on an unchecked number are the shape of the bug; the
+  parser's `HeaderBounds` is where the check goes.
+- A new limit is a documented field of `ArchiveLimits` with a default a
+  legitimate 1 GiB archive never reaches, an entry in the table in
+  `docs/security.md`, a `Limit` variant so a consumer can say which bound
+  stopped it, and a crafted archive in `tests/security_tests.rs`.
+- The defaults must never change what a well-formed archive does. The
+  differential matrix is what says so.
+
 ## Repository hygiene
 
 - Commits are SSH-signed. Never pass `--no-gpg-sign`.
