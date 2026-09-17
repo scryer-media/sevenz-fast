@@ -349,6 +349,13 @@ impl Archive {
         if nid == K_FILES_INFO {
             Self::read_files_info(header, archive, bounds)?;
             nid = header.read_u8()?;
+        } else {
+            // A header with blocks but no files info: legal enough to parse,
+            // and `read_files_info` is where the stream map is normally built.
+            // Without this the map stays empty while `blocks` is not, and the
+            // first decode indexes a zero-length `block_first_pack_stream_index`
+            // — a panic from a header of a dozen bytes.
+            Self::calculate_stream_map(archive)?;
         }
         if nid != K_END {
             return Err(Error::BadTerminatedHeader(nid));

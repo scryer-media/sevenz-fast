@@ -1000,3 +1000,25 @@ fn a_coder_declaring_absurdly_many_streams_is_refused() {
         Some(Limit::StreamsPerCoder)
     );
 }
+
+/// A header with blocks but no files info. The stream map is built while the
+/// files info is read, so without one it stayed empty while `blocks` did not —
+/// and the first decode indexed a zero-length `block_first_pack_stream_index`.
+/// Found by the `folder_graph` fuzz target; this is its input.
+#[test]
+fn a_header_with_blocks_but_no_files_does_not_panic() {
+    let mut nh = vec![K_HEADER, K_MAIN_STREAMS_INFO, K_UNPACK_INFO, K_FOLDER];
+    nh.extend_from_slice(&[
+        0x02, 0x00, 0x02, 0x41, 0x0b, 0x01, 0x0b, 0x00, 0x00, 0x02, 0x41, 0x0b, 0x41, 0x00, 0x00,
+        0x00, 0x0c, 0x0a, 0x43, 0x00, 0x00, 0x00, 0x00,
+    ]);
+    nh.push(K_END);
+
+    // Parsing may succeed or fail; decoding must not panic either way.
+    if let Ok(mut reader) = ArchiveReader::new(Cursor::new(raw_7z_exact(&nh)), Password::empty()) {
+        let _ = reader.for_each_entries(&mut |_e: &ArchiveEntry, rd: &mut dyn std::io::Read| {
+            let _ = std::io::copy(rd, &mut std::io::sink());
+            Ok(true)
+        });
+    }
+}
