@@ -18,8 +18,8 @@ use crate::codec::lz4::Lz4Decoder;
 use crate::codec::{
     filter::{bcj::BcjReader, delta::DeltaReader},
     lzma_fast::{
-        Lzma2Coder, Lzma2Control, Lzma2Plan, lzma2_decoder, lzma2_dictionary_size,
-        lzma2_memory_usage_kb,
+        Lzma2Coder, Lzma2Control, Lzma2Plan, lzma2_clamped_prop, lzma2_decoder,
+        lzma2_dictionary_size, lzma2_memory_usage_kb,
     },
 };
 use crate::container::ArchiveLimits;
@@ -157,7 +157,12 @@ pub fn add_decoder<I: Read>(
             if coder.properties.len() < 5 {
                 return Err(Error::Other("LZMA properties too short".into()));
             }
-            let dict_size = crate::codec::lzma_fast::lzma_dictionary_size(&coder.properties)?;
+            // Clamp before the budget check, so a coder that declares a huge
+            // dictionary for a small stream is decoded rather than refused.
+            let dict_size = crate::codec::lzma_fast::clamp_dictionary(
+                crate::codec::lzma_fast::lzma_dictionary_size(&coder.properties)?,
+                uncompressed_len as u64,
+            );
             let mem_size = lzma2_memory_usage_kb(dict_size);
             if mem_size > max_mem_limit_kb {
                 return Err(Error::MaxMemLimited {
@@ -165,13 +170,25 @@ pub fn add_decoder<I: Read>(
                     actaul_kb: mem_size,
                 });
             }
-            let lz =
-                crate::codec::lzma_fast::lzma_decoder(input, uncompressed_len, &coder.properties)
-                    .map_err(|e| Error::bad_password(e, !password.is_empty()))?;
+            let lz = crate::codec::lzma_fast::lzma_decoder(
+                input,
+                uncompressed_len,
+                &coder.properties,
+                dict_size,
+            )
+            .map_err(|e| Error::bad_password(e, !password.is_empty()))?;
             Ok(Decoder::Lzma(Box::new(lz)))
         }
         EncoderMethod::ID_LZMA2 => {
-            let dic_size = lzma2_dictionary_size(&coder.properties)?;
+            // The dictionary is a table index rather than a number here, so the
+            // clamp comes back as the property byte the decoders are built from.
+            let dict_prop = coder
+                .properties
+                .first()
+                .copied()
+                .ok_or_else(|| Error::other("LZMA2 properties too short"))?;
+            let dict_prop = lzma2_clamped_prop(dict_prop, uncompressed_len as u64);
+            let dic_size = lzma2_dictionary_size(&[dict_prop])?;
             let mem_size = lzma2_memory_usage_kb(dic_size);
             if mem_size > max_mem_limit_kb {
                 return Err(Error::MaxMemLimited {
@@ -191,7 +208,7 @@ pub fn add_decoder<I: Read>(
                 ),
                 None => Lzma2Plan::SingleThreaded,
             };
-            let lz = lzma2_decoder(input, &coder.properties, plan)
+            let lz = lzma2_decoder(input, dict_prop, plan)
                 .map_err(|e| Error::bad_password(e, !password.is_empty()))?;
             Ok(Decoder::Lzma2(Box::new(lz)))
         }
@@ -225,7 +242,24 @@ pub fn add_decoder<I: Read>(
         }
         #[cfg(feature = "zstd")]
         EncoderMethod::ID_ZSTD => {
-            let zs = zstd::Decoder::new(input)?;
+            let mut zs = zstd::Decoder::new(input)?;
+            // A zstd frame declares its own back-reference window, and the
+            // decoder allocates it. The format allows windows far larger than
+            // any 7z encoder writes, so the window is bounded here: by the
+            // caller's memory limit when there is one, and otherwise by the
+            // 128 MiB the reference decoder itself refuses to exceed.
+            const ZSTD_DEFAULT_WINDOW_LOG: u32 = 27;
+            let window_log = if max_mem_limit_kb == usize::MAX {
+                ZSTD_DEFAULT_WINDOW_LOG
+            } else {
+                let bytes = (max_mem_limit_kb as u64).saturating_mul(1024).max(1024);
+                // The largest power of two that fits in the budget, never above
+                // the default and never below the 1 KiB floor the format has.
+                (63 - bytes.leading_zeros())
+                    .min(ZSTD_DEFAULT_WINDOW_LOG)
+                    .max(10)
+            };
+            zs.window_log_max(window_log)?;
             Ok(Decoder::Zstd(zs))
         }
         EncoderMethod::ID_BCJ_X86 => {
@@ -273,7 +307,12 @@ pub fn add_decoder<I: Read>(
             if password.is_empty() {
                 return Err(Error::PasswordRequired);
             }
-            let de = Aes256Sha256Decoder::new(input, &coder.properties, password)?;
+            let de = Aes256Sha256Decoder::new(
+                input,
+                &coder.properties,
+                password,
+                opts.limits.max_aes_cycles_power,
+            )?;
             Ok(Decoder::Aes256Sha256(Box::new(de)))
         }
         _ => Err(Error::UnsupportedCompressionMethod(

@@ -36,8 +36,9 @@ impl<R: Read> Aes256Sha256Decoder<R> {
         input: R,
         properties: &[u8],
         password: &Password,
+        max_cycles_power: u8,
     ) -> Result<Self, crate::Error> {
-        let cipher = Cipher::from_properties(properties, password.as_slice())?;
+        let cipher = Cipher::from_properties(properties, password.as_slice(), max_cycles_power)?;
         Ok(Self {
             input,
             cipher,
@@ -129,7 +130,11 @@ impl<R: Read + Seek> Seek for Aes256Sha256Decoder<R> {
     }
 }
 
-fn get_aes_key(properties: &[u8], password: &[u8]) -> Result<([u8; 32], [u8; 16]), crate::Error> {
+fn get_aes_key(
+    properties: &[u8],
+    password: &[u8],
+    max_cycles_power: u8,
+) -> Result<([u8; 32], [u8; 16]), crate::Error> {
     let properties = match properties.len() {
         0 => {
             return Err(crate::Error::other("AES256 properties too short"));
@@ -171,10 +176,15 @@ fn get_aes_key(properties: &[u8], password: &[u8]) -> Result<([u8; 32], [u8; 16]
     } else {
         // Cap the work factor: `derive_key` runs `2^num_cycles_power` SHA-256 rounds, so
         // a crafted large power is a CPU-exhaustion DoS (and `1 << power` also overflows
-        // the shift for power >= 32). No real archive uses a power above this bound.
-        if num_cycles_power > MAX_AES_CYCLES_POWER {
-            return Err(crate::Error::other(
-                "AES num_cycles_power exceeds the supported maximum",
+        // the shift for power >= 32). The bound is the caller's
+        // `ArchiveLimits::max_aes_cycles_power`, never above what keeps the shift
+        // itself safe. No real archive uses a power above the default of 24.
+        let cap = max_cycles_power.min(MAX_AES_CYCLES_POWER);
+        if num_cycles_power > cap {
+            return Err(crate::Error::limit(
+                crate::Limit::AesCyclesPower,
+                u64::from(cap),
+                u64::from(num_cycles_power),
             ));
         }
         derive_key_cached(num_cycles_power, &salt, password)
@@ -182,11 +192,13 @@ fn get_aes_key(properties: &[u8], password: &[u8]) -> Result<([u8; 32], [u8; 16]
     Ok((aes_key, iv))
 }
 
-/// Maximum accepted AES-256 key-derivation work factor. `derive_key` runs
+/// Hard ceiling on the AES-256 key-derivation work factor, whatever the caller's
+/// `ArchiveLimits::max_aes_cycles_power` says. `derive_key` runs
 /// `2^num_cycles_power` SHA-256 rounds; 7-Zip's own encoder never exceeds this, so a
 /// larger value only ever comes from a malicious archive trying to burn CPU. Keeping it
-/// below 32 also makes the `1 << num_cycles_power` shift safe.
-const MAX_AES_CYCLES_POWER: u8 = 24;
+/// below 32 also makes the `1 << num_cycles_power` shift safe, which is why a caller
+/// cannot raise it.
+pub(crate) const MAX_AES_CYCLES_POWER: u8 = 24;
 
 fn derive_key(num_cycles_power: u8, salt: &[u8], password: &[u8]) -> [u8; 32] {
     derive_key_with::<Sha256>(num_cycles_power, salt, password)
@@ -247,8 +259,12 @@ struct Cipher {
 }
 
 impl Cipher {
-    fn from_properties(properties: &[u8], password: &[u8]) -> Result<Self, crate::Error> {
-        let (aes_key, iv) = get_aes_key(properties, password)?;
+    fn from_properties(
+        properties: &[u8],
+        password: &[u8],
+        max_cycles_power: u8,
+    ) -> Result<Self, crate::Error> {
+        let (aes_key, iv) = get_aes_key(properties, password, max_cycles_power)?;
         Ok(Self {
             dec: Aes256Cbc::new(&aes_key, &iv)
                 .map_err(|err| crate::Error::other(err.to_string()))?,
@@ -316,6 +332,7 @@ impl<W> Aes256Sha256Encoder<W> {
         let (key, iv) = crate::encryption::aes::get_aes_key(
             &options.properties(),
             options.password.as_slice(),
+            MAX_AES_CYCLES_POWER,
         )?;
 
         Ok(Self {
@@ -447,7 +464,12 @@ mod key_derivation_tests {
     fn raw_key_mode_concatenates_salt_and_password() {
         let salt = b"0123456789abcdef";
         let password = b"p\0a\0s\0s\0";
-        let (key, iv) = get_aes_key(&properties(0x3F, salt, &[0u8; 16]), password).expect("key");
+        let (key, iv) = get_aes_key(
+            &properties(0x3F, salt, &[0u8; 16]),
+            password,
+            MAX_AES_CYCLES_POWER,
+        )
+        .expect("key");
 
         let mut expected = [0u8; 32];
         expected[..16].copy_from_slice(salt);
@@ -464,13 +486,14 @@ mod key_derivation_tests {
         let salt = b"salt";
         for power in [MAX_AES_CYCLES_POWER + 1, 40, 62] {
             assert!(
-                get_aes_key(&properties(power, salt, &[0u8; 16]), b"pw").is_err(),
+                get_aes_key(&properties(power, salt, &[0u8; 16]), b"pw", MAX_AES_CYCLES_POWER)
+                    .is_err(),
                 "cycle count {power} was accepted"
             );
         }
         // The cap itself is 2^24 SHA-256 rounds, far too slow for a test; that
         // an ordinary count is accepted is covered by the round-trip tests.
-        assert!(get_aes_key(&properties(4, salt, &[0u8; 16]), b"pw").is_ok());
+        assert!(get_aes_key(&properties(4, salt, &[0u8; 16]), b"pw", MAX_AES_CYCLES_POWER).is_ok());
     }
 
     #[test]
@@ -527,7 +550,8 @@ mod tests {
     }
 
     fn assert_decodes<R: Read>(input: R, properties: &[u8], password: &Password, original: &[u8]) {
-        let mut dec = Aes256Sha256Decoder::new(input, properties, password).unwrap();
+        let mut dec =
+            Aes256Sha256Decoder::new(input, properties, password, MAX_AES_CYCLES_POWER).unwrap();
 
         let mut decoded = vec![];
         let _ = std::io::copy(&mut dec, &mut decoded).unwrap();

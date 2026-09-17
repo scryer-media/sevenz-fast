@@ -550,6 +550,38 @@ impl Archive {
             )));
         }
 
+        // The decompression-bomb bounds. Both are about what the archive says it
+        // will produce, which is the only thing that can be known before any of
+        // it is produced; the decode itself never writes more than these sizes,
+        // because every read is driven by them.
+        if opts.limits.max_unpack_bytes < u64::MAX || opts.limits.max_unpack_ratio < u64::MAX {
+            let mut unpacked_total: u64 = 0;
+            for block in &archive.blocks {
+                unpacked_total = unpacked_total
+                    .checked_add(block.get_unpack_size())
+                    .ok_or_else(|| Error::other("unpacked sizes overflow"))?;
+            }
+            if unpacked_total > opts.limits.max_unpack_bytes {
+                return Err(Error::limit(
+                    Limit::UnpackBytes,
+                    opts.limits.max_unpack_bytes,
+                    unpacked_total,
+                ));
+            }
+            // A ratio needs something to divide by: an archive of nothing but
+            // empty files packs to nothing and is not a bomb.
+            if opts.limits.max_unpack_ratio < u64::MAX && packed_total > 0 {
+                let ratio = unpacked_total / packed_total;
+                if ratio > opts.limits.max_unpack_ratio {
+                    return Err(Error::limit(
+                        Limit::UnpackRatio,
+                        opts.limits.max_unpack_ratio,
+                        ratio,
+                    ));
+                }
+            }
+        }
+
         archive.is_solid = archive
             .blocks
             .iter()

@@ -65,6 +65,45 @@ pub(crate) fn lzma2_dictionary_size(properties: &[u8]) -> Result<u32, Error> {
     Ok((2 | (bits & 1)) << (bits / 2 + 11))
 }
 
+/// The dictionary a coder actually needs: no more than the output it is going
+/// to produce.
+///
+/// A match distance can never reach further back than the number of bytes the
+/// stream has produced, so a dictionary larger than the coder's declared
+/// unpacked size is never read from — it is only allocated. The size is one
+/// header field and the output size is another, so an archive can name a 4 GiB
+/// dictionary for a 1 KiB stream and make a reader allocate the difference.
+/// 7-Zip clamps the same way (it calls it reducing the dictionary size), so
+/// this rejects nothing that decodes today.
+///
+/// Never goes below 4 KiB, the smallest dictionary the format expresses.
+pub(crate) fn clamp_dictionary(dict_size: u32, unpacked_size: u64) -> u32 {
+    const MIN_DICT: u64 = 1 << 12;
+    let needed = unpacked_size.max(MIN_DICT).min(u64::from(u32::MAX));
+    dict_size.min(needed as u32)
+}
+
+/// The LZMA2 property byte for the smallest dictionary that is still at least
+/// `dict_size`, never larger than `prop` itself declares.
+///
+/// LZMA2 carries its dictionary as one byte out of a 41-value table rather than
+/// as a number, so [`clamp_dictionary`]'s answer has to be rounded back up to a
+/// value the table can express.
+pub(crate) fn lzma2_clamped_prop(prop: u8, unpacked_size: u64) -> u8 {
+    let Ok(dict) = lzma2_dictionary_size(&[prop]) else {
+        return prop;
+    };
+    let target = u64::from(clamp_dictionary(dict, unpacked_size));
+    for candidate in 0..=prop {
+        if let Ok(size) = lzma2_dictionary_size(&[candidate])
+            && u64::from(size) >= target
+        {
+            return candidate;
+        }
+    }
+    prop
+}
+
 /// Kilobytes an LZMA2 decode of `dict_size` needs, for the reader's
 /// `max_mem_limit_kb` check.
 pub(crate) fn lzma2_memory_usage_kb(dict_size: u32) -> usize {
@@ -80,11 +119,15 @@ pub(crate) fn lzma_decoder<R: Read>(
     input: R,
     uncompressed_len: usize,
     properties: &[u8],
+    dict_size: u32,
 ) -> Result<LzmaReader<R>, std::io::Error> {
     // The caller has already rejected a properties field shorter than five
     // bytes; `LzmaProps::parse` wants exactly five.
     let mut raw = [0u8; lzma_fast::LZMA_PROPS_SIZE];
     raw.copy_from_slice(&properties[..lzma_fast::LZMA_PROPS_SIZE]);
+    // The dictionary the caller settled on, which is the declared one clamped
+    // to what the stream can actually reach back into.
+    raw[1..5].copy_from_slice(&dict_size.to_le_bytes());
     let props = LzmaProps::parse(&raw)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     LzmaReader::with_props(input, props, Some(uncompressed_len as u64))
@@ -987,10 +1030,9 @@ fn decode_error(err: lzma_fast::Error) -> std::io::Error {
 /// Builds the LZMA2 decoder for a 7z coder.
 pub(crate) fn lzma2_decoder<R: Read>(
     input: R,
-    properties: &[u8],
+    dict_prop: u8,
     plan: Lzma2Plan,
 ) -> Result<Lzma2Coder<R>, std::io::Error> {
-    let dict_prop = properties[0];
     match plan {
         Lzma2Plan::SingleThreaded => Ok(Lzma2Coder::SingleThreaded(Box::new(Lzma2Reader::new(
             input, dict_prop,
