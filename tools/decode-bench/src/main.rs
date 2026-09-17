@@ -34,7 +34,10 @@ usage: decode-bench [--runs N] [--no-oracle] [--threads LIST] [--password P] <ar
   --only NAME     run only `7zz`, `upstream` or `fork`
   --threads LIST  fork thread counts, comma separated (default 1,2,8,all)
   --password P    password for an AES-256 archive, passed to every lane
-  --cipher-only   time AES-256-CBC alone over 1 GiB in memory and exit";
+  --cipher-only   time AES-256-CBC alone over 1 GiB in memory and exit
+  --cipher-chunk KIB  chunk size for --cipher-only, repeatable (default 1024)
+  --floor         time reading <archive.7z> and digesting it, and exit
+  --io-profile    decode once through a counting reader and report read sizes";
 
 fn main() {
     let mut runs = 3usize;
@@ -44,6 +47,9 @@ fn main() {
     let mut threads: Vec<u32> = Vec::new();
     let mut password: Option<String> = None;
     let mut cipher_only = false;
+    let mut floor = false;
+    let mut cipher_chunks: Vec<usize> = Vec::new();
+    let mut io_profile = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -65,6 +71,15 @@ fn main() {
                 threads = list.split(',').map(parse_threads).collect();
             }
             "--cipher-only" => cipher_only = true,
+            "--floor" => floor = true,
+            "--io-profile" => io_profile = true,
+            "--cipher-chunk" => {
+                let kib: usize = args
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| fail("--cipher-chunk needs a size in KiB"));
+                cipher_chunks.push(kib * 1024);
+            }
             "--password" => {
                 password = Some(args.next().unwrap_or_else(|| fail("--password needs a value")));
             }
@@ -78,13 +93,32 @@ fn main() {
     }
 
     if cipher_only {
-        bench_cipher_only(runs);
+        if cipher_chunks.is_empty() {
+            cipher_chunks.push(1 << 20);
+        }
+        for chunk in cipher_chunks {
+            bench_cipher_only(runs, chunk);
+        }
         return;
     }
 
     if files.is_empty() {
         println!("{HELP}");
         std::process::exit(2);
+    }
+
+    if io_profile {
+        for file in &files {
+            io_profile_one(file, password.as_deref());
+        }
+        return;
+    }
+
+    if floor {
+        for file in &files {
+            bench_floor(file, runs);
+        }
+        return;
     }
 
     if threads.is_empty() {
@@ -102,16 +136,132 @@ fn main() {
     }
 }
 
-/// AES-256-CBC on its own: 1 GiB already in memory, decrypted in 1 MiB chunks
+/// A `Read + Seek` that records how big each read of the archive file was, so
+/// a lane that looks slow can be shown to be asking the file for the payload
+/// in small pieces rather than in the caller's buffer size.
+struct CountingSource<R> {
+    inner: R,
+}
+
+/// Reads bucketed by size, `BUCKETS[n]` counting reads of `2^n..2^(n+1)`, and
+/// the totals. Statics because the reader is moved into the archive reader and
+/// never handed back.
+static BUCKETS: [std::sync::atomic::AtomicU64; 32] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 32];
+static READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static READ_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+impl<R: Read> Read for CountingSource<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let read = self.inner.read(buf)?;
+        READS.fetch_add(1, Relaxed);
+        READ_BYTES.fetch_add(read as u64, Relaxed);
+        let bucket = usize::BITS - 1 - read.max(1).leading_zeros();
+        BUCKETS[(bucket as usize).min(31)].fetch_add(1, Relaxed);
+        Ok(read)
+    }
+}
+
+impl<R: std::io::Seek> std::io::Seek for CountingSource<R> {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(pos)
+    }
+}
+
+/// One decode through `CountingSource`, reporting the read-size histogram.
+fn io_profile_one(path: &Path, password: Option<&str>) {
+    let file = std::fs::File::open(path).expect("open archive");
+    let source = CountingSource { inner: file };
+    let mut reader =
+        sevenz_fast::ArchiveReader::new(source, fork_password(password)).expect("read header");
+    reader.set_threads(1);
+    let mut sink = Sink::default();
+    let mut buf = vec![0u8; 1 << 20];
+    reader
+        .for_each_entries(|entry, rd| {
+            if !entry.is_directory() {
+                drain(rd, &mut sink, &mut buf)?;
+            }
+            Ok(true)
+        })
+        .expect("extract");
+    use std::sync::atomic::Ordering::Relaxed;
+    let reads = READS.load(Relaxed);
+    let bytes = READ_BYTES.load(Relaxed);
+    println!(
+        "io-profile {}: {} reads for {} MiB (mean {} bytes)",
+        path.display(),
+        reads,
+        bytes / (1 << 20),
+        bytes / reads.max(1),
+    );
+    for (bucket, count) in BUCKETS.iter().enumerate() {
+        let count = count.load(Relaxed);
+        if count > 0 {
+            println!("  {:>10} bytes and up: {}", 1u64 << bucket, count);
+        }
+    }
+}
+
+/// What the machine costs to move the bytes at all: the packed stream read
+/// from the file in 1 MiB chunks, once discarded and once fed to the bench's
+/// own digest. No archive parsing, no cipher, no CRC. Every archive lane pays
+/// both of these, and `7zz t` pays only the read, so the difference between
+/// them is the part of a lane's time that is the harness rather than the
+/// decoder.
+fn bench_floor(path: &Path, runs: usize) {
+    let mut read_only = Vec::new();
+    let mut digested = Vec::new();
+    let mut bytes = 0u64;
+    for _ in 0..runs {
+        for (times, digest) in [(&mut read_only, false), (&mut digested, true)] {
+            let mut file = std::fs::File::open(path).expect("open archive");
+            let mut buf = vec![0u8; 1 << 20];
+            let mut sink = Sink::default();
+            let start = Instant::now();
+            loop {
+                let read = file.read(&mut buf).expect("read archive");
+                if read == 0 {
+                    break;
+                }
+                if digest {
+                    sink.update(&buf[..read]);
+                }
+            }
+            sink.finish();
+            times.push(start.elapsed());
+            bytes = sink.bytes.max(bytes);
+        }
+    }
+    read_only.sort_unstable();
+    digested.sort_unstable();
+    let read = read_only[read_only.len() / 2];
+    let digest = digested[digested.len() / 2];
+    let mib = bytes as f64 / (1024.0 * 1024.0);
+    println!(
+        "floor {}: read {:.3}s ({:.1} MiB/s), read+digest {:.3}s ({:.1} MiB/s), digest {:.3}s",
+        path.display(),
+        read.as_secs_f64(),
+        mib / read.as_secs_f64().max(f64::MIN_POSITIVE),
+        digest.as_secs_f64(),
+        mib / digest.as_secs_f64().max(f64::MIN_POSITIVE),
+        digest.as_secs_f64() - read.as_secs_f64(),
+    );
+}
+
+/// AES-256-CBC on its own, always over AWS-LC whichever backend the crate was
+/// built with: this lane calls `aws-lc-rs` directly, so it is the cipher's own
+/// ceiling and not a backend comparison. 1 GiB already in memory, decrypted in 1 MiB chunks
 /// with the IV carried between them, which is exactly what the reader does
 /// minus the reading. It is the floor any archive lane can reach, and the
 /// number the plumbing around the cipher is read against.
-fn bench_cipher_only(runs: usize) {
+fn bench_cipher_only(runs: usize, chunk_len: usize) {
     use aws_lc_rs::cipher::{AES_256, DecryptingKey, DecryptionContext, UnboundCipherKey};
     use aws_lc_rs::iv::FixedLength;
 
     const TOTAL: usize = 1 << 30;
-    const CHUNK: usize = 1 << 20;
+    let chunk_len = chunk_len.max(16) & !15;
 
     let key = [0x5au8; 32];
     let mut data = vec![0u8; TOTAL];
@@ -130,7 +280,7 @@ fn bench_cipher_only(runs: usize) {
         let cipher = DecryptingKey::cbc(unbound).expect("cbc");
         let mut iv = [0u8; 16];
         let start = Instant::now();
-        for chunk in data.chunks_mut(CHUNK) {
+        for chunk in data.chunks_mut(chunk_len) {
             let mut next = [0u8; 16];
             next.copy_from_slice(&chunk[chunk.len() - 16..]);
             cipher
@@ -143,11 +293,12 @@ fn bench_cipher_only(runs: usize) {
 
     let median = median(times);
     println!(
-        "cipher-only ({} backend): {:.3}s for {} MiB in {} KiB chunks, {:.1} MiB/s",
+        "cipher-only (aws-lc, called directly; crate backend is {}): \
+         {:.3}s for {} MiB in {} KiB chunks, {:.1} MiB/s",
         sevenz_fast::crypto_backend(),
         median.as_secs_f64(),
         TOTAL / (1 << 20),
-        CHUNK / 1024,
+        chunk_len / 1024,
         (TOTAL / (1 << 20)) as f64 / median.as_secs_f64()
     );
 }
