@@ -148,6 +148,16 @@ in-flight runs will not fit in decodes single-threaded rather than failing.
 The upstream change that would remove the need to hold whole batches is the
 chase-decoder request in `docs/lzma-fast-requests.md`.
 
+### macOS arm64 (Apple M5 Max, 18 cores) — pending
+
+The single-threaded series on this machine is in the history of this file
+(15.16 s on `st.7z`, 15.10 s on `mt.7z`, against 15.03 s for `7zz t -mmt=1` and
+24.5 s for upstream — 1.62x upstream and level with `7zz` at one thread). The
+parallel series has not been re-measured since the read-ahead was rewritten:
+the machine has not been idle enough for a run to be worth recording, and a
+number taken on a loaded box is worse than no number. Re-run
+`decode-bench --runs 3 <fixtures>` on a quiet machine and replace this section.
+
 ## Differential extraction
 
 Throughput is only interesting if the bytes are right. `tests/differential_7zz_tests.rs`
