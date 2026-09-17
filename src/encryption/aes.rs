@@ -1,7 +1,10 @@
 use std::{
     borrow::Cow,
-    io::{Read, Seek, Write},
+    io::{Read, Seek},
 };
+
+#[cfg(feature = "compress")]
+use std::io::Write;
 
 #[cfg(feature = "compress")]
 use aes::{
