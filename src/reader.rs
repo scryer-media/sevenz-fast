@@ -582,6 +582,20 @@ impl Archive {
             }
         }
 
+        // The caller extracts to a directory, so a name that would not stay
+        // inside one makes the archive unreadable rather than being reported
+        // per entry.
+        if opts.limits.reject_unsafe_paths {
+            for file in &archive.files {
+                if let Some(reason) = crate::archive::unsafe_path_reason(&file.name) {
+                    return Err(Error::UnsafeEntryName {
+                        name: file.name.clone(),
+                        reason,
+                    });
+                }
+            }
+        }
+
         archive.is_solid = archive
             .blocks
             .iter()
@@ -1012,8 +1026,7 @@ impl Archive {
         bounds: HeaderBounds<'_>,
     ) -> Result<(), Error> {
         archive.pack_pos = read_variable_u64(header)?;
-        let num_pack_streams =
-            bounds.count(read_variable_u64(header)?, Limit::Entries)?;
+        let num_pack_streams = bounds.count(read_variable_u64(header)?, Limit::Entries)?;
         let mut nid = header.read_u8()?;
         if nid == K_SIZE {
             archive.pack_sizes = vec![0u64; num_pack_streams];
@@ -1262,8 +1275,7 @@ impl Archive {
             bounds.count(total_in_streams, Limit::Entries)?;
             bounds.count(total_out_streams, Limit::Entries)?;
             if has_attributes {
-                let properties_size =
-                    bounds.size(read_variable_u64(header)?)?;
+                let properties_size = bounds.size(read_variable_u64(header)?)?;
                 let mut props = vec![0u8; properties_size];
                 header.read_exact(&mut props)?;
                 coder.properties = props;

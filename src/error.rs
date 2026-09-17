@@ -94,6 +94,21 @@ pub enum Error {
         /// What the archive declared, in the same unit.
         requested: u64,
     },
+    /// An entry's stored name would escape the extraction directory, and the
+    /// caller asked for such an archive to be refused.
+    ///
+    /// Only raised when [`ArchiveLimits::reject_unsafe_paths`] is set. A
+    /// consumer that lists rather than extracts leaves it off and asks
+    /// [`ArchiveEntry::is_unsafe_path`] per entry instead.
+    ///
+    /// [`ArchiveLimits::reject_unsafe_paths`]: crate::ArchiveLimits::reject_unsafe_paths
+    /// [`ArchiveEntry::is_unsafe_path`]: crate::ArchiveEntry::is_unsafe_path
+    UnsafeEntryName {
+        /// The name, as the archive stores it.
+        name: String,
+        /// Which way it is unsafe.
+        reason: &'static str,
+    },
     /// A block failed to decode, with enough context to say which bytes.
     ///
     /// This is what separates "this archive is damaged, and here is where" from
@@ -278,6 +293,12 @@ impl Error {
     pub(crate) fn in_block(self, block_index: usize, packed_offset: u64) -> Self {
         // Already located; do not re-wrap an inner block's context away.
         if matches!(self, Self::BlockDecode { .. }) {
+            return self;
+        }
+        // A limit is a refusal, not damage: the block is fine, the caller's
+        // budget is not. Keep it typed rather than rendering it into a
+        // `BlockDecode` message, so `limit_hit` still answers.
+        if matches!(self, Self::LimitExceeded { .. }) {
             return self;
         }
         let kind = match &self {

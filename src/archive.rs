@@ -248,6 +248,93 @@ impl ArchiveEntry {
     pub fn is_anti_item(&self) -> bool {
         self.is_anti_item
     }
+
+    /// The Unix mode this entry carries, when it carries one.
+    ///
+    /// 7-Zip stores a Unix mode in the high sixteen bits of the Windows
+    /// attributes and sets bit 15 to say so. A consumer that recreates
+    /// permissions, or that wants to know what kind of file this is, reads it
+    /// here rather than re-deriving the encoding.
+    #[must_use]
+    pub fn unix_mode(&self) -> Option<u32> {
+        (self.has_windows_attributes && self.windows_attributes & UNIX_EXTENSION != 0)
+            .then(|| self.windows_attributes >> 16)
+    }
+
+    /// Whether this entry is a symbolic link rather than a file.
+    ///
+    /// A symlink is stored as an ordinary entry whose *content* is the link
+    /// target, so a consumer that does not check this writes a small file of
+    /// text where a link was meant — and one that does create the link must
+    /// treat the target as hostile, because it can point anywhere.
+    #[must_use]
+    pub fn is_symlink(&self) -> bool {
+        const S_IFMT: u32 = 0xF000;
+        const S_IFLNK: u32 = 0xA000;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if let Some(mode) = self.unix_mode()
+            && mode & S_IFMT == S_IFLNK
+        {
+            return true;
+        }
+        self.has_windows_attributes && self.windows_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+
+    /// Why this entry's stored name is not safe to join to an extraction
+    /// directory, or `None` when it is.
+    ///
+    /// The name in an archive is a string the archive chose, and joining it to
+    /// a directory is how an archive writes outside that directory. Everything
+    /// here is a way of doing that:
+    ///
+    /// - an empty name, which resolves to the directory itself;
+    /// - a `..` component, which walks out of it — including as a backslash
+    ///   component, because Windows separates on both and a Unix consumer that
+    ///   only splits on `/` sees one harmless name where Windows sees two;
+    /// - a leading `/` or `\`, which ignores the directory entirely;
+    /// - a drive letter or a UNC prefix, for the same reason;
+    /// - a NUL, which truncates the path in any C API it reaches.
+    #[must_use]
+    pub fn unsafe_path_reason(&self) -> Option<&'static str> {
+        unsafe_path_reason(&self.name)
+    }
+
+    /// Whether this entry's stored name would escape an extraction directory.
+    ///
+    /// See [`ArchiveEntry::unsafe_path_reason`], which says which way.
+    #[must_use]
+    pub fn is_unsafe_path(&self) -> bool {
+        self.unsafe_path_reason().is_some()
+    }
+}
+
+/// Bit 15 of the Windows attributes: the high sixteen carry a Unix mode.
+const UNIX_EXTENSION: u32 = 0x8000;
+
+/// The shared implementation of [`ArchiveEntry::unsafe_path_reason`], also used
+/// by the reader when the caller has asked for unsafe names to be refused.
+pub(crate) fn unsafe_path_reason(name: &str) -> Option<&'static str> {
+    if name.is_empty() {
+        return Some("the entry has no name");
+    }
+    if name.contains('\0') {
+        return Some("the name contains a NUL");
+    }
+    if name.starts_with('/') || name.starts_with('\\') {
+        return Some("the name is an absolute path");
+    }
+    // `C:` anywhere a path can start: as the whole prefix, and after a
+    // separator is already covered by the component walk below.
+    let bytes = name.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+        return Some("the name names a drive");
+    }
+    for component in name.split(['/', '\\']) {
+        if component == ".." {
+            return Some("the name walks out of the extraction directory");
+        }
+    }
+    None
 }
 
 /// Configuration for encoding methods when compressing data.
