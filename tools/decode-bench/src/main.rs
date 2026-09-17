@@ -81,7 +81,10 @@ fn main() {
                 cipher_chunks.push(kib * 1024);
             }
             "--password" => {
-                password = Some(args.next().unwrap_or_else(|| fail("--password needs a value")));
+                password = Some(
+                    args.next()
+                        .unwrap_or_else(|| fail("--password needs a value")),
+                );
             }
             "-h" | "--help" => {
                 println!("{HELP}");
@@ -386,7 +389,7 @@ impl Sink {
         // Walk up to a lane boundary one word at a time, then four at a time
         // so the four multiplies are in the pipeline together.
         let mut chunks = buf.chunks_exact(8);
-        while self.words % 4 != 0 {
+        while !self.words.is_multiple_of(4) {
             let Some(chunk) = chunks.next() else { break };
             let lane = (self.words % 4) as usize;
             self.mix(lane, u64::from_le_bytes(chunk.try_into().expect("8 bytes")));
@@ -467,8 +470,8 @@ fn fork_password(password: Option<&str>) -> sevenz_fast::Password {
 /// the workers and folded, so the two should differ by noise.
 fn extract_fork_with(path: &Path, threads: u32, verify: bool, password: Option<&str>) -> Sink {
     let file = std::fs::File::open(path).expect("open archive");
-    let mut reader = sevenz_fast::ArchiveReader::new(file, fork_password(password))
-        .expect("fork: read header");
+    let mut reader =
+        sevenz_fast::ArchiveReader::new(file, fork_password(password)).expect("fork: read header");
     reader.set_threads(threads);
     reader.set_verify_checksums(verify);
     let mut sink = Sink::default();
@@ -491,8 +494,8 @@ fn extract_upstream(path: &Path, threads: u32, password: Option<&str>) -> Sink {
     let file = std::fs::File::open(path).expect("open archive");
     let upstream_password =
         password.map_or_else(sevenz_rust2::Password::empty, sevenz_rust2::Password::from);
-    let mut reader = sevenz_rust2::ArchiveReader::new(file, upstream_password)
-        .expect("upstream: read header");
+    let mut reader =
+        sevenz_rust2::ArchiveReader::new(file, upstream_password).expect("upstream: read header");
     reader.set_thread_count(threads);
     let mut sink = Sink::default();
     let mut buf = vec![0u8; 1 << 20];

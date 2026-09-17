@@ -13,7 +13,9 @@ use aes::{
 };
 
 use crate::Password;
-use crate::crypto_backend::{AES_BLOCK_LEN, Aes256Cbc, Aes256CbcLike, AesError, Sha256, Sha256Like};
+use crate::crypto_backend::{
+    AES_BLOCK_LEN, Aes256Cbc, Aes256CbcLike, AesError, Sha256, Sha256Like,
+};
 #[cfg(feature = "compress")]
 use crate::encoder_options::AesEncoderOptions;
 
