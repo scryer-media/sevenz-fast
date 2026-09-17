@@ -574,6 +574,62 @@ mod tests {
         );
     }
 
+    /// The caller's buffer is now where decryption happens, so its size is a
+    /// code path of its own: under a block it goes through the one-block
+    /// staging buffer, and a size that is not a multiple of 16 has to leave
+    /// the odd tail for the next call rather than lose it.
+    #[test]
+    fn a_caller_reading_in_odd_sizes_gets_the_same_bytes() {
+        let original = include_bytes!("aes.rs");
+        let (encoded, options, password) = encode(original);
+        let properties = options.properties();
+
+        for read_size in [1usize, 3, 15, 16, 17, 31, 4096] {
+            let mut dec = Aes256Sha256Decoder::new(
+                Cursor::new(encoded.as_slice()),
+                &properties,
+                &password,
+                MAX_AES_CYCLES_POWER,
+            )
+            .unwrap();
+
+            let mut decoded = Vec::new();
+            let mut buf = vec![0u8; read_size];
+            loop {
+                let n = dec.read(&mut buf).expect("decrypt");
+                if n == 0 {
+                    break;
+                }
+                decoded.extend_from_slice(&buf[..n]);
+            }
+            assert_eq!(
+                &decoded[..original.len()],
+                original.as_slice(),
+                "reading {read_size} bytes at a time"
+            );
+        }
+    }
+
+    /// A stream that ends mid-block is a damaged archive, not a short read.
+    #[test]
+    fn a_truncated_final_block_is_refused() {
+        let original = include_bytes!("aes.rs");
+        let (encoded, options, password) = encode(original);
+        let properties = options.properties();
+        let truncated = &encoded[..encoded.len() - 5];
+
+        let mut dec = Aes256Sha256Decoder::new(
+            Cursor::new(truncated),
+            &properties,
+            &password,
+            MAX_AES_CYCLES_POWER,
+        )
+        .unwrap();
+        let mut sink = Vec::new();
+        let err = std::io::copy(&mut dec, &mut sink).expect_err("truncated ciphertext");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
     #[test]
     fn test_aes_codec_with_fragmented_input() {
         let original = include_bytes!("aes.rs");
