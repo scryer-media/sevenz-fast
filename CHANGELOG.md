@@ -251,6 +251,19 @@ Everything here is new surface; no upstream signature changed meaning.
 
 ### Cryptography
 
+- **The AES decoder decrypts in the caller's buffer.** It used to read the
+  packed stream 512 bytes at a time into a fixed array, decrypt into a `Vec`
+  and copy that into the caller's buffer — two million reads and two full
+  copies of the payload for a 1 GiB store-mode archive. It now fills the
+  caller's buffer with ciphertext and decrypts it in place, so reads are the
+  caller's size and the payload is copied zero extra times. The only state kept
+  is the ≤15 ciphertext bytes that did not complete a block, plus one block of
+  plaintext for callers that read less than 16 bytes at a time; neither grows
+  with the stream, so the memory estimate is unchanged. On the Linux bench box
+  a 1 GiB store-mode AES archive went from 0.862 s to 0.282 s, which is under
+  half of `7zz t -p` on the same fixture and the sum of what the cipher, the
+  read and the CRC cost on their own.
+
 - Cryptography for the `aes256` coder — SHA-256 *and* AES-256-CBC — goes
   through one internal backend module, `src/crypto_backend.rs`. SHA-256 comes
   from `lzma-fast`'s crypto module. The default backend is
