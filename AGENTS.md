@@ -58,7 +58,7 @@ differential matrix in `docs/benchmarking.md`.
 
 - LZMA and LZMA2 decoding is `lzma-fast`'s, reached only through
   `src/codec/lzma_fast.rs`. Nothing else in the crate names `lzma_fast::`.
-  That file is also where the multi-threaded LZMA2 API lands when it ships; see
+  That file is also where the multi-threaded LZMA2 coder lives; see
   `docs/lzma-fast-requests.md`.
 - The BCJ, BCJ2 and delta filters are vendored from `lzma-rust2` (Apache-2.0,
   see `src/codec/filter/mod.rs`) so the crate does not carry `lzma-rust2` at
@@ -67,6 +67,37 @@ differential matrix in `docs/benchmarking.md`.
   RustCrypto when the `native-crypto` feature is on. Never call a backend
   crate directly from anywhere else.
 - CRC-32 is `crc-fast` (via `lzma-fast`'s `crc` module), never `crc32fast`.
+- **No CRC-32 is computed in a serialised section of the multi-threaded path.**
+  Checksumming is O(bytes) and the in-order section is the one place where the
+  core count does not help, so a checksum taken there is a tax that grows with
+  the archive. Checksums are computed where the bytes are produced — on the
+  worker that decoded them — and folded with `crc32_combine`, which costs the
+  same regardless of how long the pieces are. The single-threaded path is
+  exempt: it *is* the calling thread, so there is no section to serialise
+  against, and so is a block whose LZMA2 output passes through a filter (BCJ,
+  delta, BCJ2) on the way out, because the bytes the workers checksummed are
+  not the bytes the file is made of — that filter runs on the consuming thread
+  and the checksum has to run there with it. Everywhere else, the block's file
+  boundaries go to the coder as split points and `Crc32VerifyingReader` is not
+  built at all: see `BlockDecoder::file_boundaries` and `Lzma2Control::folded`.
+  Verification is not weakened by this — a corrupt block is still refused, and
+  a test asserts it under the parallel path.
+- Thread counts default to one, everywhere. A library does not decide on its
+  own to occupy every core, or to hold the memory that doing so costs; the
+  consumer asks.
+- **The parallel LZMA2 reader feeds whole runs, and never stops the ring.** The
+  decoder gives the run at its cursor to its chase path — single-threaded, on
+  the calling thread, with dispatch switched off until that run is done —
+  whenever the run's end has not arrived. So this crate walks the chunk headers
+  itself and feeds only runs it has seen the end of, and it keeps the batch
+  large enough that the one run the chase still takes at the end of a batch is
+  overlapped rather than waited on. Both rules are load-bearing: dropping
+  either cost 1.5x against a bare parallel decode at two threads. Anything
+  changing `pump_input` or the feed constants must be measured at 2, 4 and 8
+  threads, not only at the machine's full width, where the whole archive fits
+  one batch and the bug is invisible. `SEVENZ_FAST_MT_TRACE=1` prints the phase
+  split — how much was chased, how long was spent feeding, how long draining —
+  and is how that is checked.
 
 ## Repository hygiene
 

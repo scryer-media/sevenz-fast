@@ -6,15 +6,16 @@
 //!
 //! For each archive it times, in one session on one machine:
 //!
-//! - `7zz t -mmt=1` (the C reference, single-threaded),
-//! - upstream `sevenz-rust2` 0.22.2, the release weaver ships today,
-//! - this fork,
+//! - `7zz t` (the C reference, every thread) and `7zz t -mmt=1`,
+//! - upstream `sevenz-rust2` 0.22.2 — the release weaver ships today — driven
+//!   at 16 threads, which is its `Lzma2ReaderMt` path,
+//! - this fork at 1, 2, 8 and every thread.
 //!
 //! extracting every entry to a discard sink, and reports the median wall time
 //! and the MiB/s of *uncompressed* output. The numbers this produced are in
-//! `docs/benchmarking.md`; the acceptance gate for the swap is "faster than
-//! upstream, and within 5% of what `lzma-bench` gets on the bare LZMA2
-//! stream", which is what the ratios printed here are read against.
+//! `docs/benchmarking.md`. The gate is the `vs 7zz` column on the
+//! multi-threaded fixture: the container must not cost more than 5% over the
+//! reference implementation doing the same work.
 //!
 //! Not a criterion benchmark on purpose: the inputs are ~900 MiB fixtures that
 //! live outside the repository, the run takes minutes, and it is a thing an
@@ -26,17 +27,19 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const HELP: &str = "\
-usage: decode-bench [--runs N] [--no-oracle] <archive.7z> ...
+usage: decode-bench [--runs N] [--no-oracle] [--threads LIST] <archive.7z> ...
 
-  --runs N     repetitions per decoder (default 3); the median is reported
-  --no-oracle  skip `7zz t -mmt=1`
-  --only NAME  run only `7zz`, `upstream` or `fork`";
+  --runs N        repetitions per decoder (default 3); the median is reported
+  --no-oracle     skip the `7zz t` lanes
+  --only NAME     run only `7zz`, `upstream` or `fork`
+  --threads LIST  fork thread counts, comma separated (default 1,2,8,all)";
 
 fn main() {
     let mut runs = 3usize;
     let mut oracle = true;
     let mut files: Vec<PathBuf> = Vec::new();
     let mut only = String::new();
+    let mut threads: Vec<u32> = Vec::new();
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -50,6 +53,12 @@ fn main() {
             "--no-oracle" => oracle = false,
             "--only" => {
                 only = args.next().unwrap_or_else(|| fail("--only needs a name"));
+            }
+            "--threads" => {
+                let list = args
+                    .next()
+                    .unwrap_or_else(|| fail("--threads needs a list"));
+                threads = list.split(',').map(parse_threads).collect();
             }
             "-h" | "--help" => {
                 println!("{HELP}");
@@ -65,10 +74,29 @@ fn main() {
         std::process::exit(2);
     }
 
+    if threads.is_empty() {
+        threads = vec![1, 2, 8, all_threads()];
+    }
+    threads.dedup();
+
     println!("decode-bench, {runs} run(s) per decoder, median reported");
 
     for file in &files {
-        bench_one(file, runs, oracle, &only);
+        bench_one(file, runs, oracle, &only, &threads);
+    }
+}
+
+/// Every thread this machine has, which is what "all" means in the tables.
+fn all_threads() -> u32 {
+    std::thread::available_parallelism().map_or(1, |n| n.get() as u32)
+}
+
+fn parse_threads(value: &str) -> u32 {
+    match value.trim() {
+        "all" => all_threads(),
+        other => other
+            .parse()
+            .unwrap_or_else(|_| fail("--threads takes numbers or `all`")),
     }
 }
 
@@ -82,6 +110,17 @@ fn fail(msg: &str) -> ! {
 /// to have.
 struct Sink {
     bytes: u64,
+    /// Four independent accumulators, folded together at the end. One would be
+    /// a chain of dependent multiplies — about 5 cycles per 8 bytes, which is
+    /// 0.2 s per GiB and a tenth of a fast parallel decode. Four run in the
+    /// pipeline at once and cost a quarter of that.
+    lanes: [u64; 4],
+    /// Whole words folded so far. The lane a word goes to is a function of its
+    /// position in the stream and nothing else — pick the lane by where the
+    /// word falls in *this call* and the digest depends on how the decoder
+    /// happened to chunk its reads, which is exactly what it must not do.
+    words: u64,
+    /// The four folded into one, once `finish` has been called.
     digest: u64,
     /// Bytes left over from the last update, so the digest depends on the byte
     /// stream and not on where each decoder happened to end its reads.
@@ -93,7 +132,14 @@ impl Default for Sink {
     fn default() -> Self {
         Self {
             bytes: 0,
-            digest: 0xcbf2_9ce4_8422_2325,
+            lanes: [
+                0xcbf2_9ce4_8422_2325,
+                0x9e37_79b9_7f4a_7c15,
+                0xff51_afd7_ed55_8ccd,
+                0xc4ce_b9fe_1a85_ec53,
+            ],
+            words: 0,
+            digest: 0,
             tail: [0; 8],
             tail_len: 0,
         }
@@ -114,13 +160,37 @@ impl Sink {
             if self.tail_len < 8 {
                 return;
             }
-            self.mix(u64::from_le_bytes(self.tail));
+            let lane = (self.words % 4) as usize;
+            self.mix(lane, u64::from_le_bytes(self.tail));
+            self.words += 1;
             self.tail_len = 0;
         }
 
+        // Walk up to a lane boundary one word at a time, then four at a time
+        // so the four multiplies are in the pipeline together.
         let mut chunks = buf.chunks_exact(8);
+        while self.words % 4 != 0 {
+            let Some(chunk) = chunks.next() else { break };
+            let lane = (self.words % 4) as usize;
+            self.mix(lane, u64::from_le_bytes(chunk.try_into().expect("8 bytes")));
+            self.words += 1;
+        }
+        let aligned = chunks.remainder().len() + chunks.len() * 8;
+        let from = buf.len() - aligned;
+        let mut wide = buf[from..].chunks_exact(32);
+        for chunk in &mut wide {
+            for lane in 0..4 {
+                let word =
+                    u64::from_le_bytes(chunk[lane * 8..lane * 8 + 8].try_into().expect("8 bytes"));
+                self.mix(lane, word);
+            }
+            self.words += 4;
+        }
+        let mut chunks = wide.remainder().chunks_exact(8);
         for chunk in &mut chunks {
-            self.mix(u64::from_le_bytes(chunk.try_into().expect("8 bytes")));
+            let lane = (self.words % 4) as usize;
+            self.mix(lane, u64::from_le_bytes(chunk.try_into().expect("8 bytes")));
+            self.words += 1;
         }
         let rest = chunks.remainder();
         self.tail[..rest.len()].copy_from_slice(rest);
@@ -133,17 +203,26 @@ impl Sink {
     /// quarter of the fork's measured time and made the fork look 30% slower
     /// than it is.)
     #[inline]
-    fn mix(&mut self, word: u64) {
-        self.digest = (self.digest ^ word).wrapping_mul(DIGEST_K).rotate_left(23);
+    fn mix(&mut self, lane: usize, word: u64) {
+        self.lanes[lane] = (self.lanes[lane] ^ word)
+            .wrapping_mul(DIGEST_K)
+            .rotate_left(23);
     }
 
     /// Folds in whatever is left in the carry buffer. Call once per stream.
     fn finish(&mut self) -> u64 {
         for index in 0..self.tail_len {
-            self.digest = (self.digest ^ u64::from(self.tail[index])).wrapping_mul(DIGEST_K);
+            let lane = (self.words % 4) as usize;
+            self.lanes[lane] =
+                (self.lanes[lane] ^ u64::from(self.tail[index])).wrapping_mul(DIGEST_K);
         }
         self.tail_len = 0;
-        self.digest
+        let mut folded = self.bytes;
+        for lane in self.lanes {
+            folded = (folded ^ lane).wrapping_mul(DIGEST_K).rotate_left(23);
+        }
+        self.digest = folded;
+        folded
     }
 }
 
@@ -157,10 +236,19 @@ fn drain<R: Read + ?Sized>(reader: &mut R, sink: &mut Sink, buf: &mut [u8]) -> s
     }
 }
 
-fn extract_fork(path: &Path) -> Sink {
+fn extract_fork(path: &Path, threads: u32) -> Sink {
+    extract_fork_with(path, threads, true)
+}
+
+/// The fork, with the header's checksums either checked or not. The unchecked
+/// lane is there to price the checking: under the parallel path it is done by
+/// the workers and folded, so the two should differ by noise.
+fn extract_fork_with(path: &Path, threads: u32, verify: bool) -> Sink {
     let file = std::fs::File::open(path).expect("open archive");
     let mut reader = sevenz_fast::ArchiveReader::new(file, sevenz_fast::Password::empty())
         .expect("fork: read header");
+    reader.set_threads(threads);
+    reader.set_verify_checksums(verify);
     let mut sink = Sink::default();
     let mut buf = vec![0u8; 1 << 20];
     reader
@@ -175,10 +263,13 @@ fn extract_fork(path: &Path) -> Sink {
     sink
 }
 
-fn extract_upstream(path: &Path) -> Sink {
+/// Upstream at a given thread count. Above one this is its `Lzma2ReaderMt`,
+/// the multi-threaded LZMA2 reader in `lzma-rust2` that this fork replaced.
+fn extract_upstream(path: &Path, threads: u32) -> Sink {
     let file = std::fs::File::open(path).expect("open archive");
     let mut reader = sevenz_rust2::ArchiveReader::new(file, sevenz_rust2::Password::empty())
         .expect("upstream: read header");
+    reader.set_thread_count(threads);
     let mut sink = Sink::default();
     let mut buf = vec![0u8; 1 << 20];
     reader
@@ -193,12 +284,18 @@ fn extract_upstream(path: &Path) -> Sink {
     sink
 }
 
-/// `7zz t -mmt=1`: a full decode plus CRC check, with no output file, which is
-/// the closest the CLI offers to what the two library paths above do.
-fn oracle_7zz(path: &Path) -> Option<Duration> {
+/// `7zz t`: a full decode plus CRC check, with no output file, which is the
+/// closest the CLI offers to what the library paths above do. `mmt` is the
+/// thread count to pass, or `None` for the CLI's own default (every thread).
+fn oracle_7zz(path: &Path, mmt: Option<u32>) -> Option<Duration> {
+    let mmt = mmt.map(|n| format!("-mmt={n}"));
     let start = Instant::now();
-    let status = Command::new("7zz")
-        .args(["t", "-mmt=1", "-bso0", "-bsp0"])
+    let mut command = Command::new("7zz");
+    command.args(["t", "-bso0", "-bsp0"]);
+    if let Some(flag) = &mmt {
+        command.arg(flag);
+    }
+    let status = command
         .arg(path)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -212,7 +309,7 @@ fn median(mut times: Vec<Duration>) -> Duration {
     times[times.len() / 2]
 }
 
-fn bench_one(path: &Path, runs: usize, oracle: bool, only: &str) {
+fn bench_one(path: &Path, runs: usize, oracle: bool, only: &str, threads: &[u32]) {
     let wanted = |name: &str| only.is_empty() || only == name;
     let compressed = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     println!(
@@ -221,51 +318,72 @@ fn bench_one(path: &Path, runs: usize, oracle: bool, only: &str) {
         compressed as f64 / (1024.0 * 1024.0)
     );
 
-    let mut rows: Vec<(&str, Duration, Option<Sink>)> = Vec::new();
+    let mut rows: Vec<(String, Duration, Option<Sink>)> = Vec::new();
 
-    if oracle && wanted("7zz") {
-        let mut times = Vec::new();
-        for _ in 0..runs {
-            print!("  7zz …");
-            let _ = std::io::stdout().flush();
-            match oracle_7zz(path) {
-                Some(elapsed) => times.push(elapsed),
-                None => {
-                    println!("\r  7zz: unavailable          ");
-                    times.clear();
-                    break;
-                }
-            }
-            print!("\r");
-        }
-        if !times.is_empty() {
-            rows.push(("7zz t -mmt=1", median(times), None));
-        }
-    }
-
-    for (name, run) in [
-        ("sevenz-rust2 0.22.2", extract_upstream as fn(&Path) -> Sink),
-        ("sevenz-fast", extract_fork as fn(&Path) -> Sink),
-    ] {
-        if !wanted(if name == "sevenz-fast" {
-            "fork"
-        } else {
-            "upstream"
-        }) {
-            continue;
-        }
+    // Times one library lane `runs` times and keeps the last sink, so that
+    // every row can be shown to have produced the same bytes.
+    let time_it = |name: String, mut once: Box<dyn FnMut() -> Sink + '_>| {
         let mut times = Vec::new();
         let mut last = None;
         for _ in 0..runs {
             print!("  {name} …");
             let _ = std::io::stdout().flush();
             let start = Instant::now();
-            let sink = run(path);
+            let sink = once();
             times.push(start.elapsed());
             last = Some(sink);
             print!("\r");
         }
-        rows.push((name, median(times), last));
+        (name, median(times), last)
+    };
+
+    if oracle && wanted("7zz") {
+        // `7zz t` with no `-mmt` is the CLI's own default: every thread. It is
+        // the gate the fork's all-thread row is read against.
+        for (label, mmt) in [("7zz t (all)", None), ("7zz t -mmt=1", Some(1))] {
+            let mut times = Vec::new();
+            for _ in 0..runs {
+                print!("  {label} …");
+                let _ = std::io::stdout().flush();
+                match oracle_7zz(path, mmt) {
+                    Some(elapsed) => times.push(elapsed),
+                    None => {
+                        println!("\r  {label}: unavailable          ");
+                        times.clear();
+                        break;
+                    }
+                }
+                print!("\r");
+            }
+            if !times.is_empty() {
+                rows.push((label.to_string(), median(times), None));
+            }
+        }
+    }
+
+    if wanted("upstream") {
+        // Upstream's own multi-threaded path, which is `lzma-rust2`'s
+        // `Lzma2ReaderMt`. Sixteen threads: it is what weaver would be asking
+        // for today, and the crate does not scale past it on these fixtures.
+        rows.push(time_it(
+            "sevenz-rust2 0.22.2 @16".to_string(),
+            Box::new(|| extract_upstream(path, 16)),
+        ));
+    }
+
+    if wanted("fork") {
+        for &count in threads {
+            rows.push(time_it(
+                format!("sevenz-fast @{count}"),
+                Box::new(move || extract_fork(path, count)),
+            ));
+        }
+        if let Some(&count) = threads.last() {
+            rows.push(time_it(
+                format!("sevenz-fast @{count} no crc"),
+                Box::new(move || extract_fork_with(path, count, false)),
+            ));
+        }
     }
 
     let unpacked = rows
@@ -276,12 +394,16 @@ fn bench_one(path: &Path, runs: usize, oracle: bool, only: &str) {
 
     let baseline = rows
         .iter()
-        .find(|(name, _, _)| *name == "sevenz-rust2 0.22.2")
+        .find(|(name, _, _)| name.starts_with("sevenz-rust2"))
+        .map(|(_, time, _)| *time);
+    let gate = rows
+        .iter()
+        .find(|(name, _, _)| name == "7zz t (all)")
         .map(|(_, time, _)| *time);
 
     println!(
-        "  {:<22} {:>9}  {:>11}  {:>8}  digest",
-        "decoder", "median", "MiB/s", "vs 0.22.2"
+        "  {:<24} {:>9}  {:>7}  {:>9}  {:>7}  digest",
+        "decoder", "median", "MiB/s", "vs 0.22.2", "vs 7zz"
     );
     for (name, time, sink) in &rows {
         let secs = time.as_secs_f64();
@@ -294,10 +416,14 @@ fn bench_one(path: &Path, runs: usize, oracle: bool, only: &str) {
             Some(base) => format!("{:.2}x", base.as_secs_f64() / secs),
             None => "-".to_string(),
         };
+        let vs_gate = match gate {
+            Some(base) => format!("{:.3}", secs / base.as_secs_f64()),
+            None => "-".to_string(),
+        };
         let crc = sink
             .as_ref()
             .map_or_else(|| "-".to_string(), |s| format!("{:016x}", s.digest));
-        println!("  {name:<22} {secs:>8.3}s  {throughput:>11}  {ratio:>8}  {crc}");
+        println!("  {name:<24} {secs:>8.3}s  {throughput:>7}  {ratio:>9}  {vs_gate:>7}  {crc}");
     }
 
     let digests: Vec<u64> = rows
@@ -306,5 +432,34 @@ fn bench_one(path: &Path, runs: usize, oracle: bool, only: &str) {
         .collect();
     if digests.windows(2).any(|w| w[0] != w[1]) {
         println!("  WARNING: the decoders disagree on the output bytes");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Sink;
+
+    /// The digest must depend on the bytes and not on how they arrive: two
+    /// decoders that chunk their reads differently have to agree, which is the
+    /// entire point of comparing digests at all.
+    #[test]
+    fn the_digest_does_not_depend_on_how_the_bytes_are_chunked() {
+        let bytes: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
+
+        let mut whole = Sink::default();
+        whole.update(&bytes);
+        let expected = whole.finish();
+
+        for step in [1usize, 3, 7, 8, 9, 32, 33, 1000] {
+            let mut piecemeal = Sink::default();
+            for chunk in bytes.chunks(step) {
+                piecemeal.update(chunk);
+            }
+            assert_eq!(
+                piecemeal.finish(),
+                expected,
+                "reads of {step} bytes disagree with one read"
+            );
+        }
     }
 }

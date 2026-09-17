@@ -9,148 +9,205 @@ independently. Nothing in this file is a commitment by that crate.
 Anything listed here is worked around locally in the meantime, and the
 work-around is named per item.
 
-## 1. A parallel LZMA2 reader (the one that matters)
+## What has landed
 
-`src/codec/lzma_fast.rs` is the only file in this crate that names `lzma-fast`,
-and it is deliberately shaped around a `Lzma2Plan` enum with one variant today:
+### The parallel LZMA2 decoder — landed, and this fork is on it
+
+The request that mattered. `lzma-fast` now has two multi-threaded drivers, and
+this crate uses the second one:
 
 ```rust
-pub(crate) enum Lzma2Plan {
-    SingleThreaded,
+pub struct Lzma2MtOptions { pub threads: usize, pub memory_limit: u64 }
+
+// The faithful port of 7-Zip's Lzma2DecMt.c over MtDec.c: pull from a Read,
+// own the threads for the whole call.
+impl Lzma2ParallelDecoder {
+    pub fn new(dict_prop: u8, options: &Lzma2MtOptions) -> Result<Self, Error>;
+    pub fn decode<R: Read + Send, W: Write + Send>(self, input: R, out: W) -> io::Result<u64>;
+}
+pub struct Lzma2ParallelReader<R: Read + Send + 'static>; // its Read adapter
+
+// Fed input, polled output, mode switched mid-stream.
+impl Lzma2AdaptiveDecoder {
+    pub fn new(dict_prop: u8, options: &Lzma2MtOptions) -> Result<Self, Error>;
+    pub fn set_threads(&mut self, threads: usize);
+    pub fn feed(&mut self, data: &[u8]) -> Result<usize, Error>;
+    pub fn end_of_input(&mut self);
+    pub fn drain<F: FnMut(u64, &[u8])>(&mut self, sink: F) -> Result<DrainStatus, Error>;
+    pub fn pending_runs(&self) -> usize;
+    pub fn backlog(&self) -> impl ExactSizeIterator<Item = &Lzma2Run>;
+    pub fn runs_claimed(&self) -> u64;
+    pub fn in_flight_bytes(&self) -> u64;
+    pub fn spawned_threads(&self) -> usize;
+    pub fn cancel(&mut self);
 }
 ```
 
-When the multi-threaded decoder lands, this grows one variant and the decoder
-in `src/decoder.rs` does not change at all. The plan carries what the parallel
-decoder needs and this crate is the only thing that knows: the packed stream's
-byte range in the archive, a thread count, a memory ceiling, and a way to stop.
+Every constraint this file used to list is met by it:
 
-### What this crate can supply
+| asked for | how it is met |
+| --- | --- |
+| in-order output | `drain` delivers `(offset, bytes)` in order by default |
+| memory limit enforced before allocation | `Lzma2MtOptions::memory_limit`; dispatch and `feed` are both refused rather than exceeding it |
+| cancellation | `cancel()` stops the workers and joins them before returning |
+| lossless mode switch at run boundaries | `set_threads(n)`, applied at the next boundary; `1` decodes inline |
+| a public run index | `Lzma2RunScanner`, and `pending_runs`/`backlog`/`runs_claimed` on the decoder |
+| lazy workers | none are spawned until a run is actually dispatched |
+| partial-run single-threaded decode | the chase decoder decodes a run whose tail has not arrived |
 
-A 7z reader knows, before it decodes a block, exactly where that block's packed
-bytes are: `Archive::block_pack_streams(block_index)` returns absolute
-`(offset, size)` ranges, and the source is `Read + Seek`. So a seekable view of
-one pack stream can be handed over, not just a `Read`:
+**Why this crate uses the adaptive driver and not the ring.** The ring's `Read`
+adapter spawns it behind a thread and so requires `Read + Send + 'static`; a 7z
+coder's input is a bounded view of the caller's archive source, which is
+neither. The adaptive decoder borrows nothing — the work it hands to threads is
+owned copies of complete runs — and it is the only one of the two that can
+change its thread count mid-stream, which is what a consumer chasing a download
+needs. Both find runs with the same scanner and decode them with the same
+decoder, so the bytes are identical. See `src/codec/lzma_fast.rs`.
+
+### AES-256-CBC and the 7z key derivation — withdrawn
+
+This file used to ask for an AES *encryptor* and for the 7z key derivation on a
+caller-chosen backend. `lzma-fast` has since removed AES and that derivation
+altogether, deliberately: 7z cryptography is this crate's job, and that crate is
+LZMA, LZMA2 and the xz container. Both requests are therefore withdrawn, not
+outstanding.
+
+What this crate does instead, in `src/crypto_backend.rs`: AES-256-CBC is
+RustCrypto's `aes`/`cbc` on both lanes (it is the only backend with a streaming
+CBC API, and it compiles to AES-NI and to the ARMv8 cryptography extensions),
+and the backend feature now selects SHA-256 only — `lzma_fast::crypto::awslc`
+or `lzma_fast::crypto::rustcrypto`. The 7z derivation runs over a local
+`Sha256Like` trait implemented for both, which is what makes the cross-backend
+differential test possible.
+
+### Worker-side checksums — landed, and this fork folds them
+
+**The rule this serves:** no CRC-32 is computed in a serialised section of the
+multi-threaded path. Checksumming is O(bytes), and the in-order section is the
+one place where the core count does not help, so a checksum taken there is a
+tax that grows with the archive.
+
+`crates/lzma-fast/src/crc.rs` and `crates/lzma-fast/src/mt/checksum.rs`, with
+the plan wired into the **adaptive** decoder — which is the one a 7z coder can
+use:
 
 ```rust
-impl Lzma2Reader {
-    /// A reader that decodes `source` — one whole LZMA2 stream, seekable —
-    /// across `threads` workers, in order, within `memory_limit` bytes.
-    pub fn parallel<S: Read + Seek + Send>(
-        source: S,
-        dict_prop: u8,
-        threads: NonZeroU32,
-        memory_limit: u64,
-    ) -> io::Result<Self>;
+pub fn crc32_combine(crc_a: u32, crc_b: u32, len_b: u64) -> u32;
+pub fn crc64_xz_combine(crc_a: u64, crc_b: u64, len_b: u64) -> u64;
+pub struct CrcFolder<W: Foldable>;            // push (offset, len, crc), ask for a range
+
+pub enum Checksum { None, Crc32, Crc64Xz, Sha256 }
+pub struct Segment { pub offset: u64, pub len: u64, pub check: SegmentCheck }
+pub struct BlockChecks { pub unpacked_offset: u64, pub len: u64, pub digest: Option<[u8; 32]>, pub segments: Vec<Segment> }
+pub struct ChecksumPlan { /* Checksum + split points */ }
+impl ChecksumPlan {
+    pub fn new(kind: Checksum) -> Self;
+    pub fn with_split_points<I: IntoIterator<Item = u64>>(self, points: I) -> Self;
+}
+
+impl Lzma2AdaptiveDecoder {
+    pub fn set_checksum(&mut self, plan: &ChecksumPlan);
+    pub fn take_checks(&mut self) -> Vec<BlockChecks>;
 }
 ```
 
-### The constraints it has to satisfy
+What this crate does with it, in `BlockDecoder::for_each_entries`: the block's
+file boundaries — the cumulative sub-stream sizes — go in as split points, the
+segments that come back out of `take_checks` are pushed into a `CrcFolder`
+shared through `Lzma2Control`, and each file's CRC-32 is
+`CrcFolder::range(offset, len)`. The verifying reader is then not built at all,
+neither per file nor per block, so the thread delivering the bytes does no
+checksumming. `crc32_combine` and `CrcFolder` are re-exported from this crate
+rather than reimplemented.
 
-These are this crate's requirements on whatever shape the API takes, in the
-order they matter:
+Two blocks keep the streaming checksum, and both are inherent rather than
+pending:
 
-1. **In-order output.** The reader stays a `std::io::Read` whose bytes are the
-   stream's bytes. A consumer that reassembles out-of-order chunks itself is a
-   consumer this crate cannot be.
-2. **An explicit memory limit, enforced before allocation.** A parallel LZMA2
-   decode buffers a whole run of dependent chunks, so its footprint scales with
-   the run rather than with the dictionary, and
-   `Archive::decoder_memory_estimate` (which models the single-threaded
-   decoders) stops describing it. The limit has to be a parameter, and
-   exceeding it has to be an error rather than an allocation — this crate
-   refuses archives against a caller's budget before it decodes, and it cannot
-   do that for a decoder whose appetite it cannot ask about. A
-   `Lzma2Reader::parallel_memory_estimate(dict_prop, threads) -> u64` would let
-   the estimate stay honest.
-3. **Cancellation.** A consumer that gives up — a cancelled download, a closed
-   output — must be able to stop the workers without waiting for the stream to
-   finish. Dropping the reader is enough if drop joins promptly.
-4. **A lossless switch between modes at run boundaries.** Whether a stream can
-   be decoded in parallel is a property of how it was *written* (7-Zip's
-   `-mmt=on` starts a fresh dictionary per chunk run; `-mmt=1` does not), and
-   this crate cannot tell from the coder properties alone. The reader should
-   start single-threaded and widen when it reaches a run boundary that allows
-   it, rather than failing or silently producing wrong bytes: a stream that
-   turns out not to be parallelisable must still decode, at single-threaded
-   speed.
-5. **A public run index.** `st.7z` and `mt.7z` in the benchmark fixtures differ
-   only in how the encoder chunked them, and this crate cannot see the
-   difference. Something like
-   `Lzma2Reader::run_boundaries(&mut source) -> io::Result<Vec<u64>>` (packed
-   offsets of the chunks that reset the dictionary) would let this crate decide
-   whether parallel decoding is worth starting, and would let it report a
-   damaged run's offset instead of "somewhere in this block".
-6. **Lazy, cheap workers.** Most 7z blocks in practice are small. Spawning a
-   thread pool per block would cost more than it saves, so workers should be
-   created when a second run is actually available, not when the reader is
-   constructed.
-7. **Partial-run single-threaded decode.** When a run is only partly available
-   — the exact case of a download being chased — decoding what has arrived, at
-   single-threaded speed, is much better than parking. A parallel reader that
-   demands the whole run up front cannot be used by a streaming consumer at
-   all.
+- a block whose LZMA2 output passes through a filter (BCJ, delta, BCJ2) — the
+  workers' bytes are not the file's bytes, and the filter itself runs on the
+  consuming thread;
+- a block decoded single-threaded, where the consuming thread *is* the
+  decoding thread and there is no serialised section to keep clear.
 
-### Positional output, if a push API is offered instead
+## Outstanding
 
-If the parallel decoder prefers to hand out decoded pieces rather than be a
-`Read`, the pieces must be positional, so that this crate can order them:
+### A chase decoder that stands aside while a worker is free
+
+`Lzma2AdaptiveDecoder::drain` gives the run at its cursor to the chase decoder
+— the single-threaded one, on the caller's thread — whenever `dispatch` finds
+no *complete* run there, and a run is complete only once the chunk header that
+follows it has arrived. It then keeps that run to the end: `st_in_run` turns
+dispatch off until the chase is through.
+
+That is right for the case it was built for, a stream still arriving. It is
+wrong for a stream already on disk, where it happens once per batch of fed
+bytes and is not a small cost: the chase decodes in 1 MiB steps and no worker
+may start a run while it runs, so at two threads a batch of two runs spent as
+long chasing the third as the two workers spent on the other two. Measured on
+`mt.7z`, 8 runs of 128 MiB: 15.9 s against 10.6 s for the same decoder's own
+parallel path, 1.50x, with half the output produced in 1 MiB steps.
 
 ```rust
-/// `(uncompressed_offset, bytes)`, any order, every byte exactly once.
-pub fn decode_parallel(&mut self, sink: impl FnMut(u64, &[u8]) -> io::Result<()>) -> io::Result<()>;
-```
-
-### Work-around until then
-
-Every LZMA2 stream is decoded single-threaded, which is already level with
-`7zz t -mmt=1` (`docs/benchmarking.md`). Nothing is wrong; the ceiling is one
-core.
-
-## 2. An AES-256-CBC *encryptor*
-
-`lzma_fast::crypto` exposes `Aes256Cbc` with `decrypt` only, which is all a 7z
-*reader* needs. This crate also writes archives (`compress`), so the encoder in
-`src/encryption/aes.rs` still uses the RustCrypto `cbc` encryptor directly, and
-`aes`/`cbc` are dependencies of the `compress` feature for that reason alone.
-
-Wanted:
-
-```rust
-impl Aes256Cbc {
-    /// Encrypts `data` in place and advances the chaining state.
-    pub fn encrypt(&mut self, data: &mut [u8]) -> Result<(), CryptoError>;
+impl Lzma2AdaptiveDecoder {
+    /// Whether the run at the cursor may be decoded on the calling thread when
+    /// no worker can take it yet. On by default, which is the arriving-stream
+    /// case; off for a caller that would rather wait than serialise.
+    pub fn set_chase(&mut self, chase: bool);
 }
 ```
 
-on both backends. Then `src/crypto_backend.rs` covers writing as well as
-reading, `compress` stops pulling RustCrypto in, and a build with
-`aws-lc-crypto` has exactly one AES implementation in it instead of two.
+Or, without a knob at all: return `Dispatch::Busy` rather than `None` when
+`outstanding != 0` and there is no complete run at the cursor. A worker is
+already running; there is something to wait for; waiting is what `drain`
+already does everywhere else.
 
-### Work-around until then
+**Work-around until then.** This crate walks the chunk headers itself
+(`Lzma2RunScanner`, which is public — thank you) and feeds only whole runs, so
+the chase is never handed a run whose bytes are still coming in this reader's
+buffer; and the batch is sized so that the one run the chase does take at the
+end of it is overlapped by several rounds of worker work rather than being a
+third of the batch. That costs a gigabyte of read-ahead, and about two of peak
+memory, to hide something that would otherwise cost nothing at all.
 
-The encoder is on RustCrypto regardless of which backend the decoder uses. The
-two implementations agree (the differential test in `src/crypto_backend.rs`
-checks the parts that overlap), so this is a packaging wart, not a correctness
-one.
+### A drain that stops when the caller's buffer is full
 
-## 3. `sevenz_key` on a caller-chosen backend
-
-`lzma_fast::crypto::sevenz_key` uses whichever backend *that crate's* features
-select, and its precedence is AWS-LC-wins. This crate's convention is the
-opposite (`native-crypto` wins), so it cannot call `sevenz_key` without
-silently disagreeing with its own documented precedence.
-
-Wanted: the derivation generic over the digest, or exposed per backend —
+`Lzma2AdaptiveDecoder::drain` decodes everything the bytes fed so far allow and
+hands each block to a sink as `(offset, &[u8])`. A 7z coder is a `Read`: it is
+asked for as much as fits in a caller's buffer, which is typically 64 KiB to a
+few MiB, while a block out of the parallel path is a whole run — 128 MiB for an
+archive written by `7zz -mmt=on`. So every byte is copied once into a spill
+buffer here and once out of it again, and the spill buffer grows to the size of
+everything fed.
 
 ```rust
-pub mod awslc { pub fn sevenz_key(password_utf16le: &[u8], salt: &[u8], cycles: u8) -> Option<[u8; 32]>; }
-pub mod rustcrypto { /* the same */ }
+impl Lzma2AdaptiveDecoder {
+    /// As `drain`, but stops once `sink` has been handed `limit` bytes,
+    /// keeping the rest for the next call.
+    pub fn drain_upto<F>(&mut self, limit: usize, sink: F) -> Result<DrainStatus, Error>;
+}
 ```
 
-### Work-around until then
+That would let this crate hand the decoder the caller's own buffer and copy
+nothing. It would also make the *memory* of a parallel decode a function of
+what is in flight rather than of what has been fed.
 
-`src/crypto_backend.rs` defines a small `Sha256Like` trait, implements it for
-both of `lzma-fast`'s SHA-256 types, and `encryption::aes::derive_key_with`
-runs 7-Zip's derivation over it. Roughly fifteen lines, and it is what makes
-the cross-backend differential test possible, so this request is low priority.
+**Work-around until then.** What fits in the caller's buffer is copied into it
+directly from the sink and only the overflow is buffered, and the feed is
+capped so that a single `drain` cannot decode an entire archive into memory —
+though the cap has to stay large for the reason in the previous request, so the
+spill is measured in hundreds of megabytes rather than in the tens it should
+be.
+
+### A run index over a stream this crate has not started decoding
+
+`Lzma2RunScanner` is public and answers this, but it has to be fed the bytes.
+A consumer deciding *whether* to widen before it commits to a decode would
+rather ask about a packed range it can seek to:
+
+```rust
+pub fn run_boundaries<R: Read + Seek>(source: R, dict_prop: u8) -> io::Result<Vec<Lzma2Run>>;
+```
+
+**Work-around until then.** The decoder reports its own backlog as it goes
+(`Lzma2Progress::pending_runs`), which is enough for an adaptive caller: it
+widens on a backlog it can already see rather than on a prediction.

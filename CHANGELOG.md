@@ -48,10 +48,59 @@ against. Upstream's own changelog continues below, unchanged.
   `lzma-rust2` leave the decode graph rather than be carried for three filters.
   `src/codec/filter/mod.rs` documents the provenance and the mechanical
   changes.
-- `Decoder::Lzma2Mt` was removed. `lzma-fast` has no multi-threaded reader yet,
-  so the variant would have been a decoder that silently was not there; the
-  thread count now selects an `Lzma2Plan`, which is the single adapter point a
-  future parallel reader plugs into (`src/codec/lzma_fast.rs`).
+- LZMA2 decodes on several threads through `lzma-fast`'s `Lzma2AdaptiveDecoder`
+  — a stream is cut at the dictionary resets that make a *run* independently
+  decodable, and runs are decoded on workers while output stays in order.
+  Upstream's `Decoder::Lzma2Mt` (`lzma-rust2`'s `Lzma2ReaderMt`) is gone;
+  `Lzma2Plan` in `src/codec/lzma_fast.rs` is the one place that chooses, and
+  the rest of the decode chain, the CRC verification and the completion hook
+  are unchanged by the choice.
+- **The thread count now defaults to one**, where upstream defaults to
+  `available_parallelism()`. A library does not decide on its own to occupy
+  every core, or to hold the memory that doing so costs; the consumer asks with
+  `set_threads`/`with_threads`. Existing callers that set a thread count
+  explicitly are unaffected; callers that set none get today's memory and
+  today's behaviour.
+- **No CRC-32 is computed on the thread delivering the bytes when LZMA2 is
+  decoding in parallel.** The block's file boundaries go to the coder as
+  checksum split points, each worker checksums the pieces of the block it
+  produced before it queues to hand that block on, and this crate folds those
+  pieces into each file's CRC-32 — and into the block's — with
+  `crc32_combine`, which costs the same whatever the pieces weigh. The
+  verifying reader is then not built at all. What is verified, and when a
+  corrupt archive is refused, does not change; a test asserts the refusal
+  happens under the parallel path, where the streaming check is gone.
+  Single-threaded blocks, and blocks whose LZMA2 output passes through a
+  filter (BCJ, delta, BCJ2) on its way out, keep the streaming checksum: for
+  the first the consuming thread is the decoding thread, and for the second
+  the bytes the workers saw are not the bytes the file is made of.
+- The reader walks the LZMA2 chunk headers itself and feeds the decoder **whole
+  runs only**, a gigabyte or a run per thread ahead, whichever is more. Three
+  things had to be true at once. A run reaches a worker only once it has
+  arrived whole, so feeding a chunk at a time leaves nothing to dispatch and
+  decodes everything inline. Feeding without limit decodes the whole block into
+  memory before the caller sees a byte, because one `drain` decodes everything
+  the fed bytes allow. And a run whose end the decoder has not seen is taken by
+  its chase decoder, which finishes it on the calling thread with dispatch
+  switched off — so a batch must be big enough that the one run this costs at
+  its end is overlapped by several rounds of worker work, not comparable to it.
+  Feeding "a run per thread, then the rest" cost 1.50x against the bare
+  parallel decoder at two threads; feeding whole runs a gigabyte at a time is
+  within 2% of it at every thread count measured. `docs/benchmarking.md` has
+  the numbers and the memory that buys them, and
+  `docs/lzma-fast-requests.md` the upstream change that would make the
+  gigabyte unnecessary.
+- And when a good look at a stream has found no run boundary at all — what
+  `7zz -mmt=1` writes is one run from beginning to end — the reader stops
+  getting ahead altogether and lets the decoder stream it, rather than
+  buffering an entire archive to hand to a single worker at the end. That is
+  decided from the boundaries the reader has scanned, not from whether a worker
+  has appeared, so it holds however large the read-ahead is.
+- A thread count above one is a request, not a promise. A stream with no
+  dictionary resets (what `7zz -mmt=1` writes) decodes single-threaded because
+  there is nothing to cut, and a block whose memory budget has no room to hold
+  runs in flight **degrades to single-threaded rather than failing** — a limit
+  states what the caller can afford, not that the archive must be refused.
 - LZMA1 is now subject to the same dictionary memory limit as LZMA2. Upstream
   bounded only LZMA2, so an archive declaring a 4 GiB LZMA1 dictionary would
   try to allocate it.
@@ -90,6 +139,40 @@ Everything here is new surface; no upstream signature changed meaning.
   called with a `BlockCompletion { block_index, unpacked_size, crc_verified }`
   once a block has been decoded in full and its checksum verified. A block the
   caller stopped short of is not reported.
+- `ArchiveReader::set_threads` / `with_threads` / `threads` (upstream's
+  `set_thread_count` still works and forwards), and
+  `set_adaptive_lzma2` / `with_adaptive_lzma2`, which builds a block's LZMA2
+  coder so it can widen later even while the count is one. `BlockDecoder` has
+  the same four.
+- `ArchiveReader::lzma2_handle() -> Lzma2Handle`: an owned, `Send + Sync`
+  handle taken before a decode starts and used while it runs — a decode borrows
+  the reader for its duration, so the live knob cannot be a method on it.
+  `Lzma2Handle::set_threads(n)` takes effect at the next LZMA2 run boundary,
+  which is a dictionary reset and therefore lossless; `1` decodes the next run
+  inline on the calling thread, spawning nothing. `Lzma2Handle::progress()` and
+  `ArchiveReader::lzma2_progress()` report an `Lzma2Progress { block_index,
+  threads, spawned_threads, pending_runs, runs_claimed, in_flight_bytes }` —
+  `pending_runs` is the backlog of complete runs an adaptive caller widens on,
+  and `runs_claimed` is the run index of the block being decoded.
+- `ArchiveReader::set_sub_stream_complete_hook` / `clear_…`, called with a
+  `SubStreamCompletion { block_index, sub_stream_index, file_index,
+  unpacked_offset, len, crc32 }` as each file's checksum becomes final. The
+  decoder computes that checksum anyway, to check it against the header; this
+  hands the value over instead of discarding it, so a consumer reporting
+  per-file integrity never reads the bytes a second time.
+- `ArchiveReader::set_verify_checksums` / `with_verify_checksums` (and
+  `BlockDecoder::with_verify_checksums`) turn the header's CRC-32 checks off
+  for a consumer that verifies the bytes by other means — a PAR2 set over the
+  extracted files, say — and does not want to pay for the same assurance
+  twice. On by default. With it off a corrupt archive decodes into corrupt
+  bytes without complaint, which is why it is spelled out rather than implied
+  by a thread count or a limit.
+- `crc32_combine(a, b, len_b)` and `CrcFolder`, re-exported from `lzma-fast`:
+  the checksum of two pieces joined, and a heap of `(offset, len, crc32)`
+  pieces folded into any range they cover, for a consumer folding across
+  boundaries this crate does not know about, such as across blocks. Re-exported
+  rather than reimplemented, so a consumer folds with the same implementation
+  the workers checksummed with.
 - `Error::BlockDecode { block_index, packed_offset, kind, message }` with
   `BlockErrorKind::{Corrupted, ChecksumMismatch, UnsupportedMethod, Io,
   Password}`: corruption now says which block and which byte range, distinctly
@@ -101,33 +184,43 @@ Everything here is new surface; no upstream signature changed meaning.
 
 - `docs/benchmarking.md` — the harness, the acceptance gate and the numbers.
 - `docs/lzma-fast-requests.md` — the API this crate would like from
-  `lzma-fast`, with the exact signatures and the local work-around for each:
-  the parallel LZMA2 reader and its seven constraints, an AES-256-CBC
-  encryptor, and `sevenz_key` over a caller-chosen digest.
+  `lzma-fast`, with the exact signatures and the local work-around for each.
+  The parallel-decoder request landed and is recorded as such; the AES and
+  key-derivation requests were withdrawn when that crate removed both on
+  purpose; what is outstanding is worker-side checksums on the adaptive
+  decoder and a run index over a stream not yet being decoded.
+- `AGENTS.md` gained the rule this fork is now held to: no CRC-32 is computed
+  in a serialised section of the multi-threaded path, and thread counts
+  default to one.
 
 ### Cryptography
 
-- AES-256-CBC and SHA-256 for the `aes256` coder now come from `lzma-fast`'s
-  crypto module behind one internal backend module, `src/crypto_backend.rs`.
-  The default backend is `aws-lc-rs` (feature `aws-lc-crypto`, in `default`),
-  the scryer-media house convention shared with `lzma-fast` and `rarpar`;
-  `native-crypto` selects RustCrypto (`sha2`, `aes`, `cbc`) and **takes
-  precedence** when both are compiled, so a consumer who cannot build C uses
-  `default-features = false` plus `native-crypto`.
+- SHA-256 for the `aes256` coder comes from `lzma-fast`'s crypto module behind
+  one internal backend module, `src/crypto_backend.rs`. The default backend is
+  `aws-lc-rs` (feature `aws-lc-crypto`, in `default`), the scryer-media house
+  convention shared with `lzma-fast` and `rarpar`; `native-crypto` selects
+  RustCrypto's `sha2` and **takes precedence** when both are compiled, so a
+  consumer who cannot build C uses `default-features = false` plus
+  `native-crypto`.
+- **AES-256-CBC is this crate's own**, on both lanes, over RustCrypto's
+  `aes`/`cbc` in `src/crypto_backend.rs`. `lzma-fast` removed AES and the 7z
+  key derivation deliberately — 7z cryptography is this crate's job — and
+  RustCrypto is the only backend with a streaming CBC API, which is what a
+  reader taking the packed stream in whatever pieces arrive needs; it compiles
+  to AES-NI on x86-64 and to the ARMv8 cryptography extensions on aarch64.
+  The backend feature therefore selects SHA-256 and nothing else.
 - `aes256` no longer implies a backend: enabling it with neither
   `aws-lc-crypto` nor `native-crypto` is a compile error. A consumer migrating
   from upstream with `default-features = false, features = ["aes256", …]` adds
   `"aws-lc-crypto"` to that list.
 - New `sevenz_fast::crypto_backend() -> &'static str`, reporting which backend
   a build selected, for consumers who want to assert on it.
-- The `aes` and `cbc` dependencies moved from `aes256` to `compress`: only the
-  *encoder* needs them, because `lzma-fast` exposes the decrypting half of
-  AES-256-CBC, which is all a reader uses. The direct `sha2` dependency is
-  gone.
+- The `aes` and `cbc` dependencies are enabled by `aes256` (decryption) and by
+  `compress` (encryption). The direct `sha2` dependency is gone.
 - When both backends are compiled, a differential test checks they agree on
-  AES-256-CBC, on SHA-256 and on the 7z key derivation; both are checked
-  against NIST SP 800-38A F.2.6 and the SHA-256 vectors independently of each
-  other. `7zAes.c`'s two special cycle counts (`0x3F`, `>= 0x40`) have tests of
+  SHA-256 and on the 7z key derivation; AES-256-CBC is checked against NIST
+  SP 800-38A F.2.6, block by block as well as in one call, and SHA-256 against
+  its own vectors. `7zAes.c`'s two special cycle counts (`0x3F`, `>= 0x40`) have tests of
   their own.
 
 ### Testing
@@ -135,8 +228,19 @@ Everything here is new surface; no upstream signature changed meaning.
 - `tests/differential_7zz_tests.rs`: archives built with `7zz a` across the
   method matrix are extracted with both `7zz x` and this crate and compared
   byte for byte. Skips itself when `7zz` is not on `PATH`.
-- `tools/decode-bench`: times `7zz`, upstream `sevenz-rust2` 0.22.2 and this
-  fork on the same archive in one session. Results in `docs/benchmarking.md`.
+- `tests/lzma2_mt_tests.rs`: the multi-threaded path against `7zz x -so` at 1,
+  2, 8 and every thread; that the parallel path is actually engaged and reports
+  its backlog; that moving the thread count mid-archive changes no byte; that a
+  memory limit too small for threads degrades to single-threaded instead of
+  failing; that the block-completion hook still fires once per block; that
+  per-file checksums match the header and a checksum taken over the bytes by an
+  unrelated implementation; and that folding checksums equals checksumming the
+  whole. The differential matrix now runs every case through three lanes —
+  one thread, eight threads, and the adaptive coder at one thread.
+- `tools/decode-bench`: times `7zz t` (all threads and `-mmt=1`), upstream
+  `sevenz-rust2` 0.22.2 at 16 threads (its `Lzma2ReaderMt` path) and this fork
+  at 1, 2, 8 and every thread, on the same archive in one session. Results in
+  `docs/benchmarking.md`.
 - The vendored BCJ round-trip tests generate their sample data instead of
   reading the binary fixtures `lzma-rust2` keeps in its repository, which are
   not ours to vendor.

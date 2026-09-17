@@ -19,9 +19,14 @@ For each archive it runs, in one session on one machine:
 
 | Decoder | What it runs |
 | --- | --- |
-| `7zz t -mmt=1` | the C reference, single-threaded, full decode plus CRC check |
+| `7zz t (all)` | the C reference with every thread it wants, full decode plus CRC check |
+| `7zz t -mmt=1` | the same, single-threaded |
 | `sevenz-rust2 0.22.2` | the released upstream crate weaver ships today, every entry to a sink |
-| `sevenz-fast` | this fork, same code path |
+| `sevenz-fast @N` | this fork at N threads, same code path |
+| `sevenz-fast @N no crc` | the same with `set_verify_checksums(false)`, to price verification |
+
+`--threads 1,2,8,all` chooses the thread counts; `--only fork` and
+`--no-oracle` cut the run down to this crate while bisecting something.
 
 It reports the median wall time of `--runs` repetitions, the MiB/s of
 *uncompressed* output, and a 64-bit digest of the extracted bytes, so "the two
@@ -42,51 +47,106 @@ repository.
 2. within 5% of what `lzma-bench` reports for `lzma-fast` on a bare LZMA2
    stream — i.e. the 7z container path must not eat the win.
 
+For the multi-threaded path the second clause is measured *per thread count*
+against `lzma-bench --threads 1,2,4,8` on the same fixture, not only at the
+machine's full width. A block written by `7zz -mmt=on` has eight runs in it, so
+at eight threads it is one batch and every scheduling bug in the reader is
+invisible; the same bug costs 1.5x at two.
+
+## Reading a decode's phases
+
+`SEVENZ_FAST_MT_TRACE=1` makes the parallel reader print, when a block's coder
+is dropped, what that block's decode actually did:
+
+```console
+$ SEVENZ_FAST_MT_TRACE=1 ./target/release/decode-bench --runs 1 --threads 2 \
+    --only fork --no-oracle mt.7z
+mt-trace: threads=2 spawned=2 drains=2 drain=10.768s sink=0.377s/8 small=0 MiB \
+          pump=0.502s fed=897 MiB chased=0 MiB out=1024 MiB runs=8
+```
+
+- `chased` and `small` are the two ways the chase decoder shows itself: bytes
+  this reader fed knowing they were not a whole run, and bytes that came back
+  out of the decoder in pieces small enough to have come from it (it emits in
+  1 MiB steps, a worker emits a whole run). On an archive with run boundaries
+  both should be zero. On one without — `7zz -mmt=1` — `chased` should be
+  nearly everything, and `fed` should track the decode rather than run ahead
+  of it.
+- `pump` against `drain` says whether the reader is feeding or waiting.
+- `drains` is how many batches the block took: one or two is a block that fit
+  the read-ahead, a thousand is the streaming path.
+
 ## Results
 
-Apple M5 Max (18 cores), macOS 26.6.2, rustc 1.97.1, 7-Zip 26.01 (arm64, ASM),
-`lzma-fast` at `feature/pavlov-st-port` 8ccc20d with the `asm` feature on,
-release profile with fat LTO. Median of 3 runs, 1024.0 MiB of output per
-archive.
+Two machines, because the interesting number — what the parallel path does at
+two, eight and all threads — is a property of the machine's cores as much as of
+the code. Both fixtures are 1024.0 MiB of output; every figure is the median of
+three runs with the box otherwise idle.
 
-### `st.7z` (897.3 MiB packed, one single-threaded LZMA2 stream)
+### linux-x86_64 (x86-box)
 
-| Decoder | Median | MiB/s | vs upstream |
-| --- | --- | --- | --- |
-| `7zz t -mmt=1` | 15.037 s | 68.1 | 1.63x |
-| `sevenz-rust2` 0.22.2 | 24.532 s | 41.7 | 1.00x |
-| **`sevenz-fast`** | **15.163 s** | **67.5** | **1.62x** |
+12th Gen Intel Core i5-1240P: 4 performance cores with SMT (CPUs 0-7) and 8
+efficiency cores (CPUs 8-15), 16 CPUs in total, no AVX-512. 61 GiB RAM,
+rustc 1.98.1, 7-Zip 26.03 (x64, built from source with the assembly sources),
+release profile with fat LTO.
 
-### `mt.7z` (897.5 MiB packed, LZMA2 written with multi-threaded chunking)
+A hybrid machine measures two different things depending on which cores a run
+lands on, so every decoder was measured twice: once unpinned across all 16
+CPUs, and once pinned to the performance cores with `taskset -c 0-7` — applied
+identically to `7zz` and to upstream, not only to this crate.
 
-| Decoder | Median | MiB/s | vs upstream |
-| --- | --- | --- | --- |
-| `7zz t -mmt=1` | 15.032 s | 68.1 | 1.63x |
-| `sevenz-rust2` 0.22.2 | 24.495 s | 41.8 | 1.00x |
-| **`sevenz-fast`** | **15.104 s** | **67.8** | **1.62x** |
+#### `mt.7z` (897.5 MiB packed, LZMA2 written with multi-threaded chunking)
 
-Both decoders produced the same digest (`34d3ed5d2f096858`) on both archives.
+| Decoder | Unpinned | MiB/s | Pinned (P-cores) | MiB/s |
+| --- | --- | --- | --- | --- |
+| `7zz t` (all threads) | 3.864 s | 265.0 | 4.178 s | 245.1 |
+| `7zz t -mmt=1` | 20.129 s | 50.9 | 19.999 s | 51.2 |
+| `sevenz-rust2` 0.22.2 | 25.433 s | 40.3 | 28.807 s | 35.5 |
+| `sevenz-fast` @1 | 19.999 s | 51.2 | 19.931 s | 51.4 |
+| `sevenz-fast` @2 | 11.439 s | 89.5 | 11.394 s | 89.9 |
+| `sevenz-fast` @8 | 4.815 s | 212.7 | 5.175 s | 197.9 |
+| **`sevenz-fast` @16** | **4.794 s** | **213.6** | — | — |
+| `sevenz-fast` @16, no CRC | 4.781 s | 214.2 | 5.134 s (@8) | 199.5 |
 
-### Against `lzma-fast` itself
+#### `st.7z` (897.3 MiB packed, one single-threaded LZMA2 stream)
 
-`lzma-bench --runs 3 --no-oracles p256.bin.xz` on the same machine, which is
-the same LZMA2 stream shape without a 7z container around it:
+| Decoder | Unpinned | MiB/s | Pinned (P-cores) | MiB/s |
+| --- | --- | --- | --- | --- |
+| `7zz t` (all threads) | 20.069 s | 51.0 | 20.014 s | 51.2 |
+| `7zz t -mmt=1` | 20.187 s | 50.7 | 20.102 s | 50.9 |
+| `sevenz-rust2` 0.22.2 | 28.757 s | 35.6 | 28.597 s | 35.8 |
+| **`sevenz-fast` @1** | **19.970 s** | **51.3** | **19.781 s** | **51.8** |
+| `sevenz-fast` @2 | 21.170 s | 48.4 | 21.123 s | 48.5 |
+| `sevenz-fast` @8 | 21.163 s | 48.4 | 21.057 s | 48.6 |
+| `sevenz-fast` @16 | 21.154 s | 48.4 | — | — |
 
-| Measurement | MiB/s |
-| --- | --- |
-| `lzma-fast` (decode only) | 68.9 |
-| `lzma-fast` (incl. crc32) | 67.3 |
-| `sevenz-fast` on `st.7z` | 67.5 |
-| `sevenz-fast` on `mt.7z` | 67.8 |
+A stream written without dictionary resets cannot be cut, so there is nothing
+to decode in parallel and every thread count lands on the same number — 6%
+behind one thread, which is what the read-ahead and the scan cost when they buy
+nothing. `7zz` is in the same position: its own `-mmt` makes no difference on
+this fixture either.
 
-So the 7z container path costs 2.0% against the bare decoder (and nothing at
-all against the decoder with its CRC on, which is the honest comparison,
-because the 7z path verifies CRCs too). Gate met: 1.62x upstream, and level
-with `7zz` single-threaded rather than 1.3x behind it.
+#### Against `lzma-fast` itself
 
-`mt.7z` is still decoded single-threaded here — the multi-threaded LZMA2 path
-is the adapter point described in `docs/lzma-fast-requests.md`, and the numbers
-above are the single-threaded baseline it will be measured against.
+`lzma-bench --threads 1,2,4,8` on the same box and the same stream, without a
+7z container around it: **20.000 s / 10.593 s / 6.512 s / 4.058 s**.
+
+At the decoder's own boundary this crate matches that at every thread count —
+10.77 / 6.65 / 4.05 / 4.12 s at 2 / 4 / 8 / 16 threads, measured with
+`SEVENZ_FAST_MT_TRACE=1`, which is within ~2% of bare. The end-to-end lane
+above is ~0.7 s slower at eight threads: that is the copy out of the decoder's
+buffer into the caller's, plus the harness's own digest of 1 GiB. Removing the
+copy needs `drain_upto` from `docs/lzma-fast-requests.md`.
+
+#### What parallel decoding costs in memory
+
+A run in flight costs its packed *and* its unpacked bytes at once, and the
+batch fed between drains sets the peak. On the 897 MiB fixture, peak RSS is
+about **2.58 GiB at two threads and 4.06 GiB at eight**, against 376 MiB for
+the single-threaded path. `ArchiveLimits::memory` is the trade: a budget the
+in-flight runs will not fit in decodes single-threaded rather than failing.
+The upstream change that would remove the need to hold whole batches is the
+chase-decoder request in `docs/lzma-fast-requests.md`.
 
 ## Differential extraction
 

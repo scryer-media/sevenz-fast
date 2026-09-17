@@ -30,7 +30,57 @@ parity with `7zz` single-threaded. `lzma-rust2` is no longer in the library's
 runtime dependency graph; it remains only behind the `compress` feature, whose
 encoders are what write archives.
 
-Measured numbers live in [docs/benchmarking.md](docs/benchmarking.md).
+LZMA2 also decodes on several threads, by cutting the stream at the dictionary
+resets that make a run independently decodable. **The default is one thread**,
+unlike upstream, which defaults to `available_parallelism()`: a library should
+not decide on its own to occupy every core, or to hold the memory that costs.
+
+```rust
+let mut reader = ArchiveReader::new(file, Password::empty())?.with_threads(8);
+```
+
+An archive written that way decodes about six times faster on eight threads
+than on one, and within a fifth of what `7zz t` takes with every thread on the
+same machine. An archive written `-mmt=1` is one run from beginning to end and
+cannot be split at all, so a thread count above one neither helps it nor — as
+of the read-ahead rule — hurts it: see [docs/benchmarking.md](docs/benchmarking.md).
+
+The count can also be changed *while* a block is decoding, from the decoding
+thread or from another one, through a handle taken before the decode starts:
+
+```rust
+let mut reader = ArchiveReader::new(file, Password::empty())?.with_adaptive_lzma2();
+let lzma2 = reader.lzma2_handle();
+// … on whatever thread is watching the download:
+if let Some(progress) = lzma2.progress() {
+    // `pending_runs` is the backlog of complete, not-yet-claimed runs, and
+    // `runs_claimed` the run index of the block being decoded.
+    lzma2.set_threads(if progress.pending_runs > 1 { 8 } else { 1 });
+}
+```
+
+A change lands at the next run boundary, which is a dictionary reset, so
+switching is lossless: a run decoded inline and the same run decoded on a
+worker are the same decode, and the output bytes cannot tell you which
+happened. `set_threads(1)` decodes inline on the calling thread, spawning
+nothing.
+
+A thread count above one is a request, not a promise. A stream with no
+dictionary resets — what `7zz -mmt=1` writes — decodes single-threaded because
+there is nothing to cut, and so does a block whose memory budget has no room
+for runs in flight: a limit says what the caller can afford, not that the
+archive must be refused. Measured numbers live in
+[docs/benchmarking.md](docs/benchmarking.md).
+
+Parallel decoding buys its speed with memory, and this crate spends more of it
+than the runs in flight alone would need: reading a long way ahead is what
+keeps the decoder from finishing a run on the delivering thread, which is worth
+about 1.5x at low thread counts and is explained in
+[docs/lzma-fast-requests.md](docs/lzma-fast-requests.md). Decoding a 900 MiB
+block peaks around 2.5 GiB. A caller who would rather have the memory than the
+speed says so with `ArchiveLimits::memory`, which bounds the read-ahead along
+with everything else; a caller who wants neither leaves the thread count at
+one, where a block costs its dictionary and nothing else.
 
 ### 2. Container API a streaming consumer needs
 
@@ -47,7 +97,32 @@ to honour before it allocates, needs to ask the archive a few things first:
   consuming it, so the header is parsed once and blocks are decoded from the
   same source.
 - `ArchiveReader::set_block_complete_hook` reports each block once it is
-  decoded and verified.
+  decoded and verified, and `set_sub_stream_complete_hook` reports each *file*
+  as its CRC-32 becomes final, with the value — the decoder computed it to
+  check the header, so a consumer reporting per-file integrity never has to
+  read the bytes a second time.
+- `crc32_combine(a, b, len_b)` folds two checksums into the checksum of the
+  two pieces joined, and `CrcFolder` folds a heap of `(offset, len, crc32)`
+  pieces into any range they cover — for a consumer stitching across
+  boundaries this crate does not know about, such as across blocks. Both are
+  re-exported from `lzma-fast`, so a consumer folds with the same
+  implementation the decoder's workers checksummed with.
+
+### Where the checksums come from
+
+When a block's coder is LZMA2 and it is decoding in parallel, no CRC-32 is
+computed on the thread delivering the bytes. The block's file boundaries go to
+the decoder as split points, each worker checksums the pieces of the block it
+produced before handing it on, and this crate folds those pieces into each
+file's CRC-32 and compares it with the header. Verification is unchanged — a
+corrupt block is refused exactly as before — but the cost has moved off the
+one section that does not get faster with more cores.
+
+Two cases keep the streaming checksum, because for them it is the right place:
+a block decoded single-threaded, where the consuming thread is the decoding
+thread; and a block whose LZMA2 output passes through a filter (BCJ, delta,
+BCJ2), where the bytes a worker saw are not the bytes the file is made of and
+the filter runs on the consuming thread anyway.
 - `Error::BlockDecode` names the block and the packed offset for a corrupt
   archive, distinctly from I/O and unsupported-method failures.
 
@@ -58,10 +133,14 @@ upstream.
 
 ### Crypto backends
 
-The 7z `aes256` coder needs AES-256-CBC and SHA-256. The default backend is
-`aws-lc-rs`; enabling `native-crypto` switches to RustCrypto (`aes`, `cbc`,
-`sha2`) and takes precedence, so a consumer that cannot build C can use
-`default-features = false` with `aes256, native-crypto`. CRC-32 is `crc-fast`.
+The 7z `aes256` coder needs AES-256-CBC and SHA-256. The **SHA-256** backend is
+`aws-lc-rs` by default; enabling `native-crypto` switches to RustCrypto's
+`sha2` and takes precedence, so a consumer that cannot build C can use
+`default-features = false` with `aes256, native-crypto`. **AES-256-CBC is not
+part of that choice**: it is RustCrypto's `aes`/`cbc` on both lanes, which is
+the only backend with a streaming CBC API and which compiles to AES-NI on
+x86-64 and to the ARMv8 cryptography extensions on aarch64. CRC-32 is
+`crc-fast`.
 
 Because Cargo features are additive, `native-crypto` cannot mean "turn AWS-LC
 off"; it means "win when both are compiled". So `aes256` does not pull a
