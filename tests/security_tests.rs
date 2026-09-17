@@ -976,3 +976,27 @@ fn an_aes_work_factor_over_the_limit_is_refused() {
         .expect_err("a work factor over the caller's limit must be refused");
     assert_eq!(err.limit_hit(), Some(Limit::AesCyclesPower));
 }
+
+/// A single coder claiming a million streams: an allocation per stream, and a
+/// coder graph that is walked with a linear search per stream, which is the
+/// quadratic half of the same attack.
+#[test]
+fn a_coder_declaring_absurdly_many_streams_is_refused() {
+    let mut nh = vec![
+        K_HEADER,
+        K_MAIN_STREAMS_INFO,
+        K_UNPACK_INFO,
+        K_FOLDER,
+        0x01, // num_blocks = 1
+        0x00, // external = 0
+        0x01, // num_coders = 1
+        0x11, // coder flags: id_size=1, not simple
+        0x00, // coder id
+    ];
+    write_number(&mut nh, 1_000_000); // num_in_streams
+    write_number(&mut nh, 1); // num_out_streams
+    assert_eq!(
+        limit_hit(&raw_7z_exact(&nh), ArchiveLimits::default()),
+        Some(Limit::StreamsPerCoder)
+    );
+}

@@ -88,6 +88,15 @@ pub struct ArchiveLimits {
     /// LZMA2), and the chain is walked recursively when the decode stack is
     /// built.
     pub max_coders_per_block: u64,
+    /// Largest number of streams one coder may declare, in or out.
+    ///
+    /// Default: 8. Only BCJ2 takes more than one stream at all (four in, one
+    /// out); everything else is one to one. The counts are unbounded varints,
+    /// and the coder graph is walked with a linear search per stream, so a
+    /// single coder claiming a million streams is a quadratic walk as well as
+    /// a million-entry allocation. With this bound a block's whole graph is at
+    /// most `max_coders_per_block * max_streams_per_coder` streams.
+    pub max_streams_per_coder: u64,
     /// Largest number of coders in the archive, across every block.
     ///
     /// Default: 1,000,000, for the same reason as `max_entries`: a block is
@@ -139,6 +148,7 @@ impl Default for ArchiveLimits {
             max_name_bytes: 64 * KIB,
             max_total_name_bytes: 64 * MIB,
             max_coders_per_block: 8,
+            max_streams_per_coder: 8,
             max_total_coders: 1_000_000,
             max_unpack_bytes: u64::MAX,
             max_unpack_ratio: u64::MAX,
@@ -200,6 +210,7 @@ impl ArchiveLimits {
             max_name_bytes: u64::MAX,
             max_total_name_bytes: u64::MAX,
             max_coders_per_block: u64::MAX,
+            max_streams_per_coder: u64::MAX,
             max_total_coders: u64::MAX,
             max_unpack_bytes: u64::MAX,
             max_unpack_ratio: u64::MAX,

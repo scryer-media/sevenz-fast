@@ -1272,6 +1272,15 @@ impl Archive {
             total_out_streams = total_out_streams
                 .checked_add(coder.num_out_streams)
                 .ok_or_else(|| Error::other("coder stream counts exceed available input"))?;
+            if coder.num_in_streams > bounds.limits.max_streams_per_coder
+                || coder.num_out_streams > bounds.limits.max_streams_per_coder
+            {
+                return Err(Error::limit(
+                    Limit::StreamsPerCoder,
+                    bounds.limits.max_streams_per_coder,
+                    coder.num_in_streams.max(coder.num_out_streams),
+                ));
+            }
             bounds.count(total_in_streams, Limit::Entries)?;
             bounds.count(total_out_streams, Limit::Entries)?;
             if has_attributes {

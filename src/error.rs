@@ -154,6 +154,8 @@ pub enum Limit {
     TotalNameBytes,
     /// `max_coders_per_block`, in coders.
     CodersPerBlock,
+    /// `max_streams_per_coder`, in streams of one coder.
+    StreamsPerCoder,
     /// `max_total_coders`, in coders.
     TotalCoders,
     /// `memory_limit_bytes`, in bytes.
@@ -186,6 +188,7 @@ impl Limit {
             Self::NameBytes => "max_name_bytes",
             Self::TotalNameBytes => "max_total_name_bytes",
             Self::CodersPerBlock => "max_coders_per_block",
+            Self::StreamsPerCoder => "max_streams_per_coder",
             Self::TotalCoders => "max_total_coders",
             Self::MemoryBytes => "memory_limit_bytes",
             Self::UnpackBytes => "max_unpack_bytes",
