@@ -20,28 +20,40 @@
 //! choice, because "which cryptography is in my binary" is not something a
 //! crate should decide behind a consumer's back.
 //!
-//! # AES-256-CBC is this crate's own, on both lanes
+//! # AES-256-CBC is this crate's own, and it follows the same switch
 //!
 //! `lzma-fast` used to expose AES-256-CBC and the 7z key derivation; it
 //! dropped both on purpose, because 7z cryptography is this crate's job and
 //! that crate is LZMA, LZMA2 and the xz container. So the block cipher lives
-//! here, over RustCrypto's `aes`/`cbc`, and it is *not* part of the backend
-//! choice above. Three reasons:
+//! here — but it is *not* pinned to one implementation: it follows the same
+//! backend choice SHA-256 does.
 //!
-//! - CBC in a 7z reader is inherently incremental — the packed stream arrives
-//!   in whatever pieces the layer below hands over — and `cbc::Decryptor`
-//!   carries the chaining state for free. AWS-LC's CBC API is one-shot and
-//!   would rebuild the key schedule on every call.
-//! - `aes` compiles to AES-NI on x86-64 and to the ARMv8 cryptography
-//!   extensions on aarch64, so the pure-Rust lane is the hardware lane too.
-//! - It keeps the feature switch about one thing (SHA-256), which is the only
-//!   place the two backends can disagree.
+//! - **`aws-lc-crypto`** — `aws_lc_rs::cipher::DecryptingKey::cbc`, which is
+//!   AWS-LC's *unpadded* CBC mode (no PKCS7; `StreamingDecryptingKey` is the
+//!   padded one and is deliberately not used here). The key schedule is built
+//!   once, in `new`, and every call reuses it.
+//! - **`native-crypto`** — RustCrypto's `aes`/`cbc`, which compiles to AES-NI
+//!   on x86-64 and to the ARMv8 cryptography extensions on aarch64.
 //!
-//! The encoder (`compress` + `aes256`) uses `cbc::Encryptor` from the same
-//! crates, in `encryption::aes`.
+//! Driving CBC incrementally needs no streaming API on either lane: a chunk is
+//! decrypted with the current IV, and that chunk's last ciphertext block —
+//! copied out *before* the in-place decrypt — is the next chunk's IV. Both
+//! lanes require whole blocks, which costs nothing here because 7z hands over
+//! AES streams in 16-byte multiples and the caller in `encryption::aes`
+//! buffers a partial tail block either way.
+//!
+//! The encoder (`compress` + `aes256`) stays on RustCrypto's `cbc::Encryptor`
+//! in `encryption::aes`: writing archives is not the hot path this fork
+//! exists for, and one encryptor is simpler than two.
 
+#[cfg(feature = "native-crypto")]
 use aes::Aes256;
+#[cfg(feature = "native-crypto")]
 use aes::cipher::{BlockModeDecrypt, KeyIvInit};
+#[cfg(feature = "aws-lc-crypto")]
+use aws_lc_rs::cipher::{AES_256, DecryptingKey, DecryptionContext, UnboundCipherKey};
+#[cfg(feature = "aws-lc-crypto")]
+use aws_lc_rs::iv::FixedLength;
 
 #[cfg(all(feature = "aws-lc-crypto", not(feature = "native-crypto")))]
 pub(crate) use lzma_fast::crypto::awslc::Sha256;
@@ -79,6 +91,14 @@ pub(crate) enum AesError {
     IvLength,
     /// The ciphertext was not a whole number of blocks.
     BlockAlignment,
+    /// The backend refused the key or the buffer. AWS-LC reports failures
+    /// without a reason, so there is nothing more specific to say. The
+    /// RustCrypto lane cannot produce it.
+    #[cfg_attr(
+        any(feature = "native-crypto", not(feature = "aws-lc-crypto")),
+        allow(dead_code)
+    )]
+    Backend,
 }
 
 impl std::fmt::Display for AesError {
@@ -87,36 +107,98 @@ impl std::fmt::Display for AesError {
             Self::KeyLength => "an AES-256 key is 32 bytes",
             Self::IvLength => "an AES initialisation vector is 16 bytes",
             Self::BlockAlignment => "AES-CBC ciphertext is a whole number of 16-byte blocks",
+            Self::Backend => "the AES backend refused the key or the ciphertext",
         })
     }
 }
 
 impl std::error::Error for AesError {}
 
-/// Unpadded AES-256-CBC decryption.
+/// The shape both AES-256-CBC backends share, so `encryption::aes` is written
+/// once against one name and the cross-backend test can drive either one.
 ///
-/// The chaining state carries across calls, so a caller may decrypt a stream
-/// in whatever block-aligned pieces it has. 7z streams are never padded: the
-/// coder's declared unpacked size is what ends the decode.
-pub(crate) struct Aes256Cbc(cbc::Decryptor<Aes256>);
+/// Unpadded: 7z streams carry no padding, the coder's declared unpacked size
+/// is what ends the decode. The chaining state carries across calls, so a
+/// caller may decrypt a stream in whatever block-aligned pieces it has.
+pub(crate) trait Aes256CbcLike: Sized {
+    /// A decryptor for `key` starting from `iv`.
+    fn new(key: &[u8], iv: &[u8]) -> Result<Self, AesError>;
+    /// Decrypts `data` in place and advances the chaining state.
+    fn decrypt(&mut self, data: &mut [u8]) -> Result<(), AesError>;
+}
 
-impl std::fmt::Debug for Aes256Cbc {
+/// AES-256-CBC over AWS-LC.
+///
+/// `DecryptingKey::cbc` is the unpadded mode (`OperatingMode::CBC`, no PKCS7),
+/// and `decrypt` takes `&self`, so the key schedule built here is reused by
+/// every chunk. The IV for the next chunk is this chunk's last ciphertext
+/// block, copied out before the in-place decrypt destroys it.
+#[cfg(feature = "aws-lc-crypto")]
+// Built even when `native-crypto` wins the selection, so a build with both
+// features can compare the two lanes against each other.
+#[cfg_attr(feature = "native-crypto", allow(dead_code))]
+pub(crate) struct AwsLcAes256Cbc {
+    key: DecryptingKey,
+    iv: [u8; AES_BLOCK_LEN],
+}
+
+#[cfg(feature = "aws-lc-crypto")]
+impl std::fmt::Debug for AwsLcAes256Cbc {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Never print key or chaining state.
-        f.write_str("Aes256Cbc(..)")
+        f.write_str("AwsLcAes256Cbc(..)")
     }
 }
 
-impl Aes256Cbc {
-    /// A decryptor for `key` starting from `iv`.
-    pub(crate) fn new(key: &[u8], iv: &[u8]) -> Result<Self, AesError> {
+#[cfg(feature = "aws-lc-crypto")]
+impl Aes256CbcLike for AwsLcAes256Cbc {
+    fn new(key: &[u8], iv: &[u8]) -> Result<Self, AesError> {
+        let key: &[u8; AES256_KEY_LEN] = key.try_into().map_err(|_| AesError::KeyLength)?;
+        let iv: [u8; AES_BLOCK_LEN] = iv.try_into().map_err(|_| AesError::IvLength)?;
+        let unbound = UnboundCipherKey::new(&AES_256, key).map_err(|_| AesError::Backend)?;
+        let key = DecryptingKey::cbc(unbound).map_err(|_| AesError::Backend)?;
+        Ok(Self { key, iv })
+    }
+
+    fn decrypt(&mut self, data: &mut [u8]) -> Result<(), AesError> {
+        if !data.len().is_multiple_of(AES_BLOCK_LEN) {
+            return Err(AesError::BlockAlignment);
+        }
+        if data.is_empty() {
+            return Ok(());
+        }
+        let mut next_iv = [0u8; AES_BLOCK_LEN];
+        next_iv.copy_from_slice(&data[data.len() - AES_BLOCK_LEN..]);
+        self.key
+            .decrypt(data, DecryptionContext::Iv128(FixedLength::from(self.iv)))
+            .map_err(|_| AesError::Backend)?;
+        self.iv = next_iv;
+        Ok(())
+    }
+}
+
+/// AES-256-CBC over RustCrypto's `aes`/`cbc`, for builds without a C
+/// toolchain. `cbc::Decryptor` carries the chaining state itself.
+#[cfg(feature = "native-crypto")]
+pub(crate) struct RustCryptoAes256Cbc(cbc::Decryptor<Aes256>);
+
+#[cfg(feature = "native-crypto")]
+impl std::fmt::Debug for RustCryptoAes256Cbc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never print key or chaining state.
+        f.write_str("RustCryptoAes256Cbc(..)")
+    }
+}
+
+#[cfg(feature = "native-crypto")]
+impl Aes256CbcLike for RustCryptoAes256Cbc {
+    fn new(key: &[u8], iv: &[u8]) -> Result<Self, AesError> {
         let key: &[u8; AES256_KEY_LEN] = key.try_into().map_err(|_| AesError::KeyLength)?;
         let iv: &[u8; AES_BLOCK_LEN] = iv.try_into().map_err(|_| AesError::IvLength)?;
         Ok(Self(cbc::Decryptor::<Aes256>::new(key.into(), iv.into())))
     }
 
-    /// Decrypts `data` in place and advances the chaining state.
-    pub(crate) fn decrypt(&mut self, data: &mut [u8]) -> Result<(), AesError> {
+    fn decrypt(&mut self, data: &mut [u8]) -> Result<(), AesError> {
         if !data.len().is_multiple_of(AES_BLOCK_LEN) {
             return Err(AesError::BlockAlignment);
         }
@@ -127,6 +209,13 @@ impl Aes256Cbc {
         Ok(())
     }
 }
+
+/// The cipher this build selected, under one name. `native-crypto` takes
+/// precedence exactly as it does for SHA-256.
+#[cfg(feature = "native-crypto")]
+pub(crate) type Aes256Cbc = RustCryptoAes256Cbc;
+#[cfg(all(feature = "aws-lc-crypto", not(feature = "native-crypto")))]
+pub(crate) type Aes256Cbc = AwsLcAes256Cbc;
 
 /// The shape both backends' SHA-256 share, so the key derivation can be
 /// written once and run against either one. `lzma-fast` exposes two concrete
@@ -260,6 +349,130 @@ mod tests {
                     (state >> 24) as u8
                 })
                 .collect()
+        }
+
+        use super::{
+            AES_BLOCK_LEN, Aes256CbcLike, AwsLcAes256Cbc, RustCryptoAes256Cbc,
+            tests::{NIST_CIPHERTEXT, NIST_IV, NIST_KEY, NIST_PLAINTEXT, hex, unhex},
+        };
+
+        /// The NIST vector on *both* lanes, not only the selected one.
+        #[test]
+        fn both_lanes_match_the_nist_vector() {
+            let mut a = unhex(NIST_CIPHERTEXT);
+            AwsLcAes256Cbc::new(&unhex(NIST_KEY), &unhex(NIST_IV))
+                .expect("key and iv are sized")
+                .decrypt(&mut a)
+                .expect("aligned ciphertext");
+            assert_eq!(hex(&a), NIST_PLAINTEXT, "aws-lc");
+
+            let mut b = unhex(NIST_CIPHERTEXT);
+            RustCryptoAes256Cbc::new(&unhex(NIST_KEY), &unhex(NIST_IV))
+                .expect("key and iv are sized")
+                .decrypt(&mut b)
+                .expect("aligned ciphertext");
+            assert_eq!(hex(&b), NIST_PLAINTEXT, "rustcrypto");
+        }
+
+        /// Whole-buffer decryption, several sizes, both lanes byte-identical.
+        #[test]
+        fn backends_agree_on_aes256_cbc() {
+            let key = sample(32, 11);
+            let iv = sample(AES_BLOCK_LEN, 12);
+            for blocks in [1usize, 2, 3, 7, 64] {
+                let data = sample(blocks * AES_BLOCK_LEN, 100 + blocks as u64);
+
+                let mut a = data.clone();
+                AwsLcAes256Cbc::new(&key, &iv)
+                    .expect("sized")
+                    .decrypt(&mut a)
+                    .expect("aligned");
+                let mut b = data;
+                RustCryptoAes256Cbc::new(&key, &iv)
+                    .expect("sized")
+                    .decrypt(&mut b)
+                    .expect("aligned");
+
+                assert_eq!(a, b, "backends disagree on {blocks} blocks");
+            }
+        }
+
+        /// The chaining state has to survive being driven in pieces, and the
+        /// pieces a 7z reader hands over are whatever the layer below produced
+        /// — so the chunk sizes here are deliberately uneven. Each lane is
+        /// compared both against the other and against its own one-shot
+        /// result, which is what catches an IV carried wrongly.
+        #[test]
+        fn backends_agree_when_driven_in_chunks() {
+            let key = sample(32, 21);
+            let iv = sample(AES_BLOCK_LEN, 22);
+            let data = sample(64 * AES_BLOCK_LEN, 23);
+
+            let mut oneshot = data.clone();
+            AwsLcAes256Cbc::new(&key, &iv)
+                .expect("sized")
+                .decrypt(&mut oneshot)
+                .expect("aligned");
+
+            for chunk_blocks in [1usize, 2, 3, 5, 13] {
+                let chunk = chunk_blocks * AES_BLOCK_LEN;
+
+                let mut aws = AwsLcAes256Cbc::new(&key, &iv).expect("sized");
+                let mut rc = RustCryptoAes256Cbc::new(&key, &iv).expect("sized");
+                let (mut out_a, mut out_b) = (Vec::new(), Vec::new());
+                for piece in data.chunks(chunk) {
+                    let mut a = piece.to_vec();
+                    aws.decrypt(&mut a).expect("aligned");
+                    out_a.extend_from_slice(&a);
+
+                    let mut b = piece.to_vec();
+                    rc.decrypt(&mut b).expect("aligned");
+                    out_b.extend_from_slice(&b);
+                }
+
+                assert_eq!(out_a, oneshot, "aws-lc differs in {chunk}-byte chunks");
+                assert_eq!(out_b, oneshot, "rustcrypto differs in {chunk}-byte chunks");
+            }
+        }
+
+        /// An empty call must be a no-op on both lanes rather than an error or
+        /// a disturbed IV: a coder below can hand over zero bytes.
+        #[test]
+        fn an_empty_chunk_changes_nothing() {
+            let key = sample(32, 31);
+            let iv = sample(AES_BLOCK_LEN, 32);
+            let data = sample(4 * AES_BLOCK_LEN, 33);
+
+            for empty_first in [true, false] {
+                let mut aws = AwsLcAes256Cbc::new(&key, &iv).expect("sized");
+                let mut rc = RustCryptoAes256Cbc::new(&key, &iv).expect("sized");
+                if empty_first {
+                    aws.decrypt(&mut []).expect("empty is fine");
+                    rc.decrypt(&mut []).expect("empty is fine");
+                }
+                let mut a = data.clone();
+                aws.decrypt(&mut a).expect("aligned");
+                let mut b = data.clone();
+                rc.decrypt(&mut b).expect("aligned");
+                assert_eq!(a, b);
+            }
+        }
+
+        /// A half block is refused by both, with the same error.
+        #[test]
+        fn backends_agree_on_refusing_a_partial_block() {
+            let key = sample(32, 41);
+            let iv = sample(AES_BLOCK_LEN, 42);
+            let mut data = sample(AES_BLOCK_LEN + 1, 43);
+
+            let a = AwsLcAes256Cbc::new(&key, &iv)
+                .expect("sized")
+                .decrypt(&mut data.clone());
+            let b = RustCryptoAes256Cbc::new(&key, &iv)
+                .expect("sized")
+                .decrypt(&mut data);
+            assert_eq!(a, Err(super::AesError::BlockAlignment));
+            assert_eq!(b, Err(super::AesError::BlockAlignment));
         }
 
         #[test]

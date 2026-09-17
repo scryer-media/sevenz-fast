@@ -26,16 +26,17 @@ default = ["aes256", "aws-lc-crypto", "bzip2", "compress", "ppmd", "util"]
 # wasm has no C toolchain, so it takes the RustCrypto backend.
 default_wasm = ["aes256_wasm", "native-crypto", "bzip2", "compress", "ppmd", "util"]
 nt-time = ["dep:nt-time"]
-aes256 = ["dep:getrandom", "dep:aes", "dep:cbc"]
+aes256 = ["dep:getrandom"]
 aes256_wasm = ["aes256", "getrandom/wasm_js"]
-# SHA-256 backends for `aes256`. See `src/crypto_backend.rs`: the features are
-# additive, so `native-crypto` does not turn `aws-lc-crypto` off — it takes
-# precedence over it. A build that wants no AWS-LC asks for
-# `default-features = false` plus `native-crypto`. Enabling `aes256` with
-# neither is a compile error, not a silent choice. AES-256-CBC itself is not
-# part of this choice: it is RustCrypto's `aes`/`cbc` on both lanes.
-aws-lc-crypto = ["lzma-fast/crypto"]
-native-crypto = ["lzma-fast/native-crypto"]
+# Cryptography backends for `aes256` — both SHA-256 *and* AES-256-CBC. See
+# `src/crypto_backend.rs`: the features are additive, so `native-crypto` does
+# not turn `aws-lc-crypto` off — it takes precedence over it. A build that
+# wants no AWS-LC asks for `default-features = false` plus `native-crypto`.
+# Enabling `aes256` with neither is a compile error, not a silent choice. The
+# encoder's AES stays on RustCrypto's `cbc::Encryptor`, so `compress` pulls
+# `aes`/`cbc` in regardless of the backend.
+aws-lc-crypto = ["dep:aws-lc-rs", "lzma-fast/crypto"]
+native-crypto = ["dep:aes", "dep:cbc", "lzma-fast/native-crypto"]
 brotli = ["dep:brotli"]
 bzip2 = ["dep:bzip2"]
 compress = ["dep:lzma-rust2", "dep:aes", "dep:cbc"]
@@ -47,6 +48,10 @@ zstd = ["dep:zstd"]
 
 [dependencies]
 aes = { version = "0.9", optional = true }
+# The same pin and the same features `lzma-fast` uses, so a build that has both
+# crates resolves one copy of AWS-LC. AES-256-CBC is this crate's own (7z
+# cryptography is not `lzma-fast`'s job), so the dependency is direct.
+aws-lc-rs = { version = "1.18.1", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"], optional = true }
 brotli = { version = ">= 7, < 10", default-features = false, optional = true, features = ["std"] }
 bzip2 = { version = "0.6", optional = true }
 cbc = { version = "0.2", optional = true }
