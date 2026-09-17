@@ -19,7 +19,7 @@ use crate::{
     codec::lzma_fast::{Lzma2Control, Lzma2Handle, Lzma2Progress},
     container::{ArchiveLimits, BlockCompletion, SubStreamCompletion},
     decoder::{DecodeOptions, add_decoder},
-    error::Error,
+    error::{Error, Limit},
 };
 
 /// Upper bound for eagerly pre-allocating an output buffer from an archive-declared
@@ -331,11 +331,11 @@ impl Archive {
     fn read_header<R: Read + Seek>(
         header: &mut R,
         archive: &mut Archive,
-        limit: usize,
+        bounds: HeaderBounds<'_>,
     ) -> Result<(), Error> {
         let mut nid = header.read_u8()?;
         if nid == K_ARCHIVE_PROPERTIES {
-            Self::read_archive_properties(header, limit)?;
+            Self::read_archive_properties(header, bounds)?;
             nid = header.read_u8()?;
         }
 
@@ -343,11 +343,11 @@ impl Archive {
             return Err(Error::other("Additional streams unsupported"));
         }
         if nid == K_MAIN_STREAMS_INFO {
-            Self::read_streams_info(header, archive, limit)?;
+            Self::read_streams_info(header, archive, bounds)?;
             nid = header.read_u8()?;
         }
         if nid == K_FILES_INFO {
-            Self::read_files_info(header, archive, limit)?;
+            Self::read_files_info(header, archive, bounds)?;
             nid = header.read_u8()?;
         }
         if nid != K_END {
@@ -357,12 +357,15 @@ impl Archive {
         Ok(())
     }
 
-    fn read_archive_properties<R: Read + Seek>(header: &mut R, limit: usize) -> Result<(), Error> {
+    fn read_archive_properties<R: Read + Seek>(
+        header: &mut R,
+        bounds: HeaderBounds<'_>,
+    ) -> Result<(), Error> {
         let mut nid = header.read_u8()?;
         while nid != K_END {
             // Bound the skip length against the buffer: an unbounded value cast to `i64`
             // could go negative and seek backwards, re-reading the same bytes forever.
-            let property_size = bounded_count(read_variable_u64(header)?, limit, "propertySize")?;
+            let property_size = bounds.size(read_variable_u64(header)?)?;
             header.seek(SeekFrom::Current(property_size as i64))?;
             nid = header.read_u8()?;
         }
@@ -460,12 +463,21 @@ impl Archive {
         let mut buf_reader = buf.as_slice();
         let mut nid = buf_reader.read_u8()?;
         let mut header = if nid == K_ENCODED_HEADER {
+            // A compressed header is one level of nesting: this header, plus the
+            // one it decodes to. A caller that allows fewer refuses it outright.
+            if opts.limits.max_header_depth < 2 {
+                return Err(Error::limit(
+                    Limit::HeaderDepth,
+                    u64::from(opts.limits.max_header_depth),
+                    2,
+                ));
+            }
             let (mut out_reader, buf_size) = Self::read_encoded_header(
                 &mut buf_reader,
                 reader,
                 &mut archive,
                 password,
-                next_header_size_int,
+                HeaderBounds::new(next_header_size_int, opts.limits),
                 opts,
             )?;
             // Read the decoded header lazily instead of pre-allocating `buf_size` bytes:
@@ -498,9 +510,44 @@ impl Archive {
         let header_len_bound = header.len();
         let mut header = std::io::Cursor::new(&mut header);
         if nid == K_HEADER {
-            Self::read_header(&mut header, &mut archive, header_len_bound)?;
+            Self::read_header(
+                &mut header,
+                &mut archive,
+                HeaderBounds::new(header_len_bound, opts.limits),
+            )?;
+        } else if nid == K_ENCODED_HEADER {
+            // A compressed header that decodes to another one. Nothing writes
+            // this, and following it would be a recursion driven by a few bytes
+            // of input, so it is refused as the depth limit it is.
+            return Err(Error::limit(
+                Limit::HeaderDepth,
+                u64::from(opts.limits.max_header_depth),
+                3,
+            ));
         } else {
             return Err(Error::other("Broken or unsupported archive: no Header"));
+        }
+
+        // Every packed byte the header describes has to be inside the file. The
+        // pack streams are laid out end to end from `pack_pos`, so they cannot
+        // overlap or run backwards by construction; what is not implied is that
+        // the last one ends inside the archive. Without this, a header can send a
+        // decode reading at an arbitrary offset, and a coder can be handed a
+        // length that is only ever going to end in a short read part-way through.
+        let mut packed_total: u64 = 0;
+        for size in &archive.pack_sizes {
+            packed_total = packed_total
+                .checked_add(*size)
+                .ok_or_else(|| Error::other("pack sizes overflow"))?;
+        }
+        let packed_end = SIGNATURE_HEADER_SIZE
+            .checked_add(archive.pack_pos)
+            .and_then(|start| start.checked_add(packed_total))
+            .ok_or_else(|| Error::other("pack stream range out of range"))?;
+        if packed_end > reader_len {
+            return Err(Error::other(format!(
+                "pack streams end at {packed_end}, past the end of a {reader_len}-byte archive"
+            )));
         }
 
         archive.is_solid = archive
@@ -516,10 +563,10 @@ impl Archive {
         reader: &'r mut RI,
         archive: &mut Archive,
         password: &Password,
-        limit: usize,
+        bounds: HeaderBounds<'_>,
         opts: &DecodeOptions<'_>,
     ) -> Result<(Box<dyn Read + 'r>, usize), Error> {
-        Self::read_streams_info(header, archive, limit)?;
+        Self::read_streams_info(header, archive, bounds)?;
         let block = archive
             .blocks
             .first()
@@ -534,7 +581,19 @@ impl Archive {
 
         reader.seek(SeekFrom::Start(block_offset))?;
         let coder_len = block.coders.len();
-        let unpack_size = block.get_unpack_size() as usize;
+        // The decoded header is buffered whole before it can be parsed, and this
+        // size is a header-declared number multiplied by whatever the coder can
+        // amplify: a kilobyte of packed input may claim to unpack to a terabyte.
+        let declared_unpack = block.get_unpack_size();
+        if declared_unpack > bounds.limits.max_header_unpacked_bytes {
+            return Err(Error::limit(
+                Limit::HeaderUnpackedBytes,
+                bounds.limits.max_header_unpacked_bytes,
+                declared_unpack,
+            ));
+        }
+        let unpack_size = usize::try_from(declared_unpack)
+            .map_err(|_| Error::other("encoded header unpack size out of range"))?;
         let pack_size = archive.pack_sizes[first_pack_stream_index] as usize;
         let input_reader = BoundedReader::new(reader, pack_size);
         let mut decoder: Box<dyn Read> = Box::new(input_reader);
@@ -573,22 +632,22 @@ impl Archive {
     fn read_streams_info<R: Read>(
         header: &mut R,
         archive: &mut Archive,
-        limit: usize,
+        bounds: HeaderBounds<'_>,
     ) -> Result<(), Error> {
         let mut nid = header.read_u8()?;
         if nid == K_PACK_INFO {
-            Self::read_pack_info(header, archive, limit)?;
+            Self::read_pack_info(header, archive, bounds)?;
             nid = header.read_u8()?;
         }
 
         if nid == K_UNPACK_INFO {
-            Self::read_unpack_info(header, archive, limit)?;
+            Self::read_unpack_info(header, archive, bounds)?;
             nid = header.read_u8()?;
         } else {
             archive.blocks.clear();
         }
         if nid == K_SUB_STREAMS_INFO {
-            Self::read_sub_streams_info(header, archive, limit)?;
+            Self::read_sub_streams_info(header, archive, bounds)?;
             nid = header.read_u8()?;
         }
         if nid != K_END {
@@ -601,9 +660,9 @@ impl Archive {
     fn read_files_info<R: Read + Seek>(
         header: &mut R,
         archive: &mut Archive,
-        limit: usize,
+        bounds: HeaderBounds<'_>,
     ) -> Result<(), Error> {
-        let num_files = bounded_count(read_variable_u64(header)?, limit, "num files")?;
+        let num_files = bounds.count(read_variable_u64(header)?, Limit::Entries)?;
         let mut files: Vec<ArchiveEntry> = vec![Default::default(); num_files];
 
         let mut is_empty_stream: Option<BitSet> = None;
@@ -649,10 +708,14 @@ impl Archive {
                         return Err(Error::other("file names length invalid"));
                     }
 
-                    let size = bounded_count(size, limit, "file names length")?;
+                    let size = bounds.count(size, Limit::TotalNameBytes)?;
                     // let mut names = vec![0u8; size - 1];
                     // header.read_exact(&mut names)?;
-                    let names_reader = NamesReader::new(header, size - 1);
+                    let names_reader = NamesReader::new(
+                        header,
+                        size - 1,
+                        usize::try_from(bounds.limits.max_name_bytes).unwrap_or(usize::MAX),
+                    );
 
                     let mut next_file = 0;
                     for s in names_reader {
@@ -734,11 +797,11 @@ impl Archive {
                 K_DUMMY => {
                     // Bound the skip against the buffer: an unbounded value cast to `i64`
                     // could go negative and seek backwards, re-reading the same bytes forever.
-                    let skip = bounded_count(size, limit, "files-info property size")?;
+                    let skip = bounds.size(size)?;
                     header.seek(SeekFrom::Current(skip as i64))?;
                 }
                 _ => {
-                    let skip = bounded_count(size, limit, "files-info property size")?;
+                    let skip = bounds.size(size)?;
                     header.seek(SeekFrom::Current(skip as i64))?;
                 }
             };
@@ -914,11 +977,11 @@ impl Archive {
     fn read_pack_info<R: Read>(
         header: &mut R,
         archive: &mut Archive,
-        limit: usize,
+        bounds: HeaderBounds<'_>,
     ) -> Result<(), Error> {
         archive.pack_pos = read_variable_u64(header)?;
         let num_pack_streams =
-            bounded_count(read_variable_u64(header)?, limit, "num pack streams")?;
+            bounds.count(read_variable_u64(header)?, Limit::Entries)?;
         let mut nid = header.read_u8()?;
         if nid == K_SIZE {
             archive.pack_sizes = vec![0u64; num_pack_streams];
@@ -948,22 +1011,37 @@ impl Archive {
     fn read_unpack_info<R: Read>(
         header: &mut R,
         archive: &mut Archive,
-        limit: usize,
+        bounds: HeaderBounds<'_>,
     ) -> Result<(), Error> {
         let nid = header.read_u8()?;
         if nid != K_FOLDER {
             return Err(Error::other(format!("Expected kFolder, got {nid}")));
         }
-        let num_blocks = bounded_count(read_variable_u64(header)?, limit, "num blocks")?;
+        let num_blocks = bounds.count(read_variable_u64(header)?, Limit::Entries)?;
 
-        archive.blocks.reserve_exact(num_blocks);
+        // Grow into the count rather than reserving it: a `Block` is a hundred-odd
+        // bytes and the count is one, so the reservation is the amplification the
+        // byte bound alone does not cover.
+        archive.blocks.reserve(num_blocks.min(1024));
         let external = header.read_u8()?;
         if external != 0 {
             return Err(Error::ExternalUnsupported);
         }
 
+        // A block is cheap to declare and a coder is not, so the coders are counted
+        // across the whole archive as well as per block.
+        let mut total_coders: u64 = 0;
         for _ in 0..num_blocks {
-            archive.blocks.push(Self::read_block(header, limit)?);
+            let block = Self::read_block(header, bounds)?;
+            total_coders = total_coders.saturating_add(block.coders.len() as u64);
+            if total_coders > bounds.limits.max_total_coders {
+                return Err(Error::limit(
+                    Limit::TotalCoders,
+                    bounds.limits.max_total_coders,
+                    total_coders,
+                ));
+            }
+            archive.blocks.push(block);
         }
 
         let nid = header.read_u8()?;
@@ -977,7 +1055,7 @@ impl Archive {
             // `total_output_streams` is bounded in `read_block`, but clamp the eager
             // reservation to `limit` as well so it can never over-allocate.
             let tos = block.total_output_streams;
-            block.unpack_sizes.reserve_exact(tos.min(limit));
+            block.unpack_sizes.reserve_exact(tos.min(bounds.bytes));
             for _ in 0..tos {
                 block.unpack_sizes.push(read_variable_u64(header)?);
             }
@@ -1006,7 +1084,7 @@ impl Archive {
     fn read_sub_streams_info<R: Read>(
         header: &mut R,
         archive: &mut Archive,
-        limit: usize,
+        bounds: HeaderBounds<'_>,
     ) -> Result<(), Error> {
         for block in archive.blocks.iter_mut() {
             block.num_unpack_sub_streams = 1;
@@ -1017,12 +1095,12 @@ impl Archive {
         if nid == K_NUM_UNPACK_STREAM {
             total_unpack_streams = 0;
             for block in archive.blocks.iter_mut() {
-                let num_streams = bounded_count(read_variable_u64(header)?, limit, "numStreams")?;
+                let num_streams = bounds.count(read_variable_u64(header)?, Limit::Entries)?;
                 block.num_unpack_sub_streams = num_streams;
                 // Each sub-stream still consumes header bytes downstream, so the running
                 // total stays bounded by `limit`; reject anything larger up front.
                 total_unpack_streams += num_streams;
-                if total_unpack_streams > limit {
+                if total_unpack_streams > bounds.bytes {
                     return Err(Error::other("total unpack streams exceeds available input"));
                 }
             }
@@ -1114,10 +1192,10 @@ impl Archive {
         Ok(())
     }
 
-    fn read_block<R: Read>(header: &mut R, limit: usize) -> Result<Block, Error> {
+    fn read_block<R: Read>(header: &mut R, bounds: HeaderBounds<'_>) -> Result<Block, Error> {
         let mut block = Block::default();
 
-        let num_coders = bounded_count(read_variable_u64(header)?, limit, "num coders")?;
+        let num_coders = bounds.count(read_variable_u64(header)?, Limit::CodersPerBlock)?;
         let mut coders = Vec::with_capacity(num_coders);
         let mut total_in_streams: u64 = 0;
         let mut total_out_streams: u64 = 0;
@@ -1149,12 +1227,11 @@ impl Archive {
             total_out_streams = total_out_streams
                 .checked_add(coder.num_out_streams)
                 .ok_or_else(|| Error::other("coder stream counts exceed available input"))?;
-            if total_in_streams > limit as u64 || total_out_streams > limit as u64 {
-                return Err(Error::other("coder stream counts exceed available input"));
-            }
+            bounds.count(total_in_streams, Limit::Entries)?;
+            bounds.count(total_out_streams, Limit::Entries)?;
             if has_attributes {
                 let properties_size =
-                    bounded_count(read_variable_u64(header)?, limit, "properties size")?;
+                    bounds.size(read_variable_u64(header)?)?;
                 let mut props = vec![0u8; properties_size];
                 header.read_exact(&mut props)?;
                 coder.properties = props;
@@ -1219,25 +1296,164 @@ impl Archive {
         }
         block.packed_streams = packed_streams;
 
+        Self::validate_coder_graph(&block)?;
+
         Ok(block)
+    }
+
+    /// Checks that a block's coders form a decodable graph before anything is
+    /// built out of it.
+    ///
+    /// The bind pairs and packed-stream indices are attacker-controlled numbers
+    /// that the decode stack walks as if they were a chain. Three things make
+    /// that walk safe, and none of them are implied by the counts alone:
+    ///
+    /// - every stream index is in range, and no stream is bound or packed twice
+    ///   (a stream bound twice leaves another one unbound, which is a second
+    ///   "final" output);
+    /// - exactly one output stream is unbound — the block's actual output;
+    /// - the graph is acyclic. A cycle makes the ordered coder walk revisit
+    ///   coders forever, which is an unbounded stack of decoders built from a
+    ///   handful of header bytes.
+    fn validate_coder_graph(block: &Block) -> Result<(), Error> {
+        let total_in = block.total_input_streams;
+        let total_out = block.total_output_streams;
+
+        let mut in_bound = vec![false; total_in];
+        let mut out_bound = vec![false; total_out];
+        for bp in &block.bind_pairs {
+            // Ranges were checked as the pairs were read; this is the duplicate check.
+            let (i, o) = (bp.in_index as usize, bp.out_index as usize);
+            if in_bound[i] || out_bound[o] {
+                return Err(Error::other("bind pairs bind a stream twice"));
+            }
+            in_bound[i] = true;
+            out_bound[o] = true;
+        }
+
+        for &ps in &block.packed_streams {
+            let i = usize::try_from(ps)
+                .ok()
+                .filter(|i| *i < total_in)
+                .ok_or_else(|| Error::other("packed stream references an out-of-range stream"))?;
+            if in_bound[i] {
+                return Err(Error::other("packed stream is also bound by a bind pair"));
+            }
+            in_bound[i] = true;
+        }
+        if in_bound.iter().any(|bound| !bound) {
+            return Err(Error::other("block leaves an input stream unaccounted for"));
+        }
+
+        let unbound_outputs = out_bound.iter().filter(|bound| !**bound).count();
+        if unbound_outputs != 1 {
+            return Err(Error::other(
+                "block must have exactly one unbound output stream",
+            ));
+        }
+
+        // Which coder owns each stream index. Both totals are the sums that were
+        // bounded as the coders were read.
+        let mut coder_of_in = Vec::with_capacity(total_in);
+        let mut coder_of_out = Vec::with_capacity(total_out);
+        for (ci, coder) in block.coders.iter().enumerate() {
+            for _ in 0..coder.num_in_streams {
+                coder_of_in.push(ci);
+            }
+            for _ in 0..coder.num_out_streams {
+                coder_of_out.push(ci);
+            }
+        }
+        debug_assert_eq!(coder_of_in.len(), total_in);
+        debug_assert_eq!(coder_of_out.len(), total_out);
+
+        // Depth-first from the block's output back through the bind pairs, with
+        // the coders on the current path marked: meeting one of them again is a
+        // cycle.
+        const UNSEEN: u8 = 0;
+        const ON_PATH: u8 = 1;
+        const DONE: u8 = 2;
+        let mut state = vec![UNSEEN; block.coders.len()];
+        let final_out = out_bound
+            .iter()
+            .position(|bound| !*bound)
+            .expect("exactly one unbound output");
+        let mut stack = vec![(coder_of_out[final_out], 0usize)];
+        while let Some((coder_index, step)) = stack.pop() {
+            if step == 0 {
+                match state[coder_index] {
+                    ON_PATH => return Err(Error::other("block's coders form a cycle")),
+                    DONE => continue,
+                    _ => state[coder_index] = ON_PATH,
+                }
+            }
+            // This coder's input streams, in order; `step` is how many have been walked.
+            let first_in = block.coders[..coder_index]
+                .iter()
+                .map(|c| c.num_in_streams as usize)
+                .sum::<usize>();
+            let num_in = block.coders[coder_index].num_in_streams as usize;
+            if step < num_in {
+                stack.push((coder_index, step + 1));
+                if let Some(bp) = block.find_bind_pair_for_in_stream((first_in + step) as u64) {
+                    stack.push((coder_of_out[bp.out_index as usize], 0));
+                }
+            } else {
+                state[coder_index] = DONE;
+            }
+        }
+
+        Ok(())
     }
 }
 
-/// Validates an attacker-controlled count/size decoded from the header against an upper
-/// bound derived from the input (the number of bytes in the header buffer).
+/// What the header is allowed to claim, and what it is being read out of.
 ///
-/// Every counted element (a file, pack stream, coder, sub-stream, name byte, …) consumes
-/// at least one header byte downstream, so a legitimate count can never exceed the buffer
-/// length. Rejecting anything larger stops a tiny archive from declaring a huge count and
-/// forcing an out-of-memory allocation, without rejecting any valid archive.
-#[inline]
-fn bounded_count(value: u64, limit: usize, field: &str) -> Result<usize, Error> {
-    if value > limit as u64 {
-        return Err(Error::other(format!(
-            "{field} ({value}) exceeds the available input ({limit} bytes)"
-        )));
+/// Two independent bounds, and every count is checked against both.
+///
+/// - `bytes` is the header buffer's length. Everything a header describes — a
+///   file, a coder, a pack stream, a name — costs at least one byte to
+///   describe, so no legitimate count can exceed it. This bound comes from the
+///   archive itself and needs no caller.
+/// - [`ArchiveLimits`] is what the caller will believe. The byte bound alone
+///   is not enough: a count is one byte and the entry it reserves is tens or
+///   hundreds, so a 64 MiB header could still ask for gigabytes of `Vec`.
+#[derive(Clone, Copy)]
+struct HeaderBounds<'a> {
+    bytes: usize,
+    limits: &'a ArchiveLimits,
+}
+
+impl<'a> HeaderBounds<'a> {
+    fn new(bytes: usize, limits: &'a ArchiveLimits) -> Self {
+        Self { bytes, limits }
     }
-    Ok(value as usize)
+
+    /// Checks a count of things the header goes on to describe.
+    fn count(self, value: u64, what: Limit) -> Result<usize, Error> {
+        if value > self.bytes as u64 {
+            return Err(Error::limit(Limit::ArchiveBytes, self.bytes as u64, value));
+        }
+        let cap = match what {
+            Limit::CodersPerBlock => self.limits.max_coders_per_block,
+            Limit::TotalCoders => self.limits.max_total_coders,
+            Limit::TotalNameBytes => self.limits.max_total_name_bytes,
+            _ => self.limits.max_entries,
+        };
+        if value > cap {
+            return Err(Error::limit(what, cap, value));
+        }
+        // Bounded by `self.bytes`, which is a `usize`.
+        Ok(value as usize)
+    }
+
+    /// Checks a size in bytes that the header goes on to spend on itself.
+    fn size(self, value: u64) -> Result<usize, Error> {
+        if value > self.bytes as u64 {
+            return Err(Error::limit(Limit::ArchiveBytes, self.bytes as u64, value));
+        }
+        Ok(value as usize)
+    }
 }
 
 fn read_variable_u64<R: Read>(reader: &mut R) -> io::Result<u64> {
@@ -1288,14 +1504,20 @@ fn read_bits<R: Read>(header: &mut R, size: usize) -> io::Result<BitSet> {
 struct NamesReader<'a, R: Read> {
     max_bytes: usize,
     read_bytes: usize,
+    /// Longest one name may be, in bytes of UTF-16. A names blob is one
+    /// length for all of the names in it, so without this a single name may
+    /// be the whole blob — which is not an allocation problem here, but is one
+    /// for everything downstream that treats a name as a path.
+    max_name_bytes: usize,
     cache: Vec<u16>,
     reader: &'a mut R,
 }
 
 impl<'a, R: Read> NamesReader<'a, R> {
-    fn new(reader: &'a mut R, max_bytes: usize) -> Self {
+    fn new(reader: &'a mut R, max_bytes: usize, max_name_bytes: usize) -> Self {
         Self {
             max_bytes,
+            max_name_bytes,
             reader,
             read_bytes: 0,
             cache: Vec::with_capacity(16),
@@ -1321,6 +1543,13 @@ impl<R: Read> Iterator for NamesReader<'_, R> {
             let u = u16::from_le_bytes(buf);
             if u == 0 {
                 break;
+            }
+            if self.cache.len() * 2 >= self.max_name_bytes {
+                return Some(Err(Error::limit(
+                    Limit::NameBytes,
+                    self.max_name_bytes as u64,
+                    self.max_name_bytes as u64 + 2,
+                )));
             }
             self.cache.push(u);
         }
