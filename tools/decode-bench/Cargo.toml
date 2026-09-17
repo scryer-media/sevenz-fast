@@ -7,6 +7,13 @@ publish = false
 rust-version = "1.97.1"
 version = "0.0.0"
 
+# `native-crypto` swaps this crate's AES-256-CBC and SHA-256 over to
+# RustCrypto, so the same binary can time either cryptography backend:
+#   cargo build --release -p decode-bench                        # AWS-LC
+#   cargo build --release -p decode-bench --features native-crypto
+[features]
+native-crypto = ["sevenz-fast/native-crypto"]
+
 [dependencies]
 # The fork under test.
 sevenz-fast = { path = "../..", default-features = false, features = ["aes256", "aws-lc-crypto", "brotli", "bzip2", "deflate", "lz4", "ppmd", "util", "zstd"] }

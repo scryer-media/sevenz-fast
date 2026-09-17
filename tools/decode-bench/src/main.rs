@@ -27,12 +27,13 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const HELP: &str = "\
-usage: decode-bench [--runs N] [--no-oracle] [--threads LIST] <archive.7z> ...
+usage: decode-bench [--runs N] [--no-oracle] [--threads LIST] [--password P] <archive.7z> ...
 
   --runs N        repetitions per decoder (default 3); the median is reported
   --no-oracle     skip the `7zz t` lanes
   --only NAME     run only `7zz`, `upstream` or `fork`
-  --threads LIST  fork thread counts, comma separated (default 1,2,8,all)";
+  --threads LIST  fork thread counts, comma separated (default 1,2,8,all)
+  --password P    password for an AES-256 archive, passed to every lane";
 
 fn main() {
     let mut runs = 3usize;
@@ -40,6 +41,7 @@ fn main() {
     let mut files: Vec<PathBuf> = Vec::new();
     let mut only = String::new();
     let mut threads: Vec<u32> = Vec::new();
+    let mut password: Option<String> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -60,6 +62,9 @@ fn main() {
                     .unwrap_or_else(|| fail("--threads needs a list"));
                 threads = list.split(',').map(parse_threads).collect();
             }
+            "--password" => {
+                password = Some(args.next().unwrap_or_else(|| fail("--password needs a value")));
+            }
             "-h" | "--help" => {
                 println!("{HELP}");
                 return;
@@ -79,10 +84,13 @@ fn main() {
     }
     threads.dedup();
 
-    println!("decode-bench, {runs} run(s) per decoder, median reported");
+    println!(
+        "decode-bench, {runs} run(s) per decoder, median reported, crypto backend {}",
+        sevenz_fast::crypto_backend()
+    );
 
     for file in &files {
-        bench_one(file, runs, oracle, &only, &threads);
+        bench_one(file, runs, oracle, &only, &threads, password.as_deref());
     }
 }
 
@@ -236,16 +244,21 @@ fn drain<R: Read + ?Sized>(reader: &mut R, sink: &mut Sink, buf: &mut [u8]) -> s
     }
 }
 
-fn extract_fork(path: &Path, threads: u32) -> Sink {
-    extract_fork_with(path, threads, true)
+fn extract_fork(path: &Path, threads: u32, password: Option<&str>) -> Sink {
+    extract_fork_with(path, threads, true, password)
+}
+
+/// The password each lane gets, or an empty one for an unencrypted archive.
+fn fork_password(password: Option<&str>) -> sevenz_fast::Password {
+    password.map_or_else(sevenz_fast::Password::empty, sevenz_fast::Password::from)
 }
 
 /// The fork, with the header's checksums either checked or not. The unchecked
 /// lane is there to price the checking: under the parallel path it is done by
 /// the workers and folded, so the two should differ by noise.
-fn extract_fork_with(path: &Path, threads: u32, verify: bool) -> Sink {
+fn extract_fork_with(path: &Path, threads: u32, verify: bool, password: Option<&str>) -> Sink {
     let file = std::fs::File::open(path).expect("open archive");
-    let mut reader = sevenz_fast::ArchiveReader::new(file, sevenz_fast::Password::empty())
+    let mut reader = sevenz_fast::ArchiveReader::new(file, fork_password(password))
         .expect("fork: read header");
     reader.set_threads(threads);
     reader.set_verify_checksums(verify);
@@ -265,9 +278,11 @@ fn extract_fork_with(path: &Path, threads: u32, verify: bool) -> Sink {
 
 /// Upstream at a given thread count. Above one this is its `Lzma2ReaderMt`,
 /// the multi-threaded LZMA2 reader in `lzma-rust2` that this fork replaced.
-fn extract_upstream(path: &Path, threads: u32) -> Sink {
+fn extract_upstream(path: &Path, threads: u32, password: Option<&str>) -> Sink {
     let file = std::fs::File::open(path).expect("open archive");
-    let mut reader = sevenz_rust2::ArchiveReader::new(file, sevenz_rust2::Password::empty())
+    let upstream_password =
+        password.map_or_else(sevenz_rust2::Password::empty, sevenz_rust2::Password::from);
+    let mut reader = sevenz_rust2::ArchiveReader::new(file, upstream_password)
         .expect("upstream: read header");
     reader.set_thread_count(threads);
     let mut sink = Sink::default();
@@ -287,7 +302,7 @@ fn extract_upstream(path: &Path, threads: u32) -> Sink {
 /// `7zz t`: a full decode plus CRC check, with no output file, which is the
 /// closest the CLI offers to what the library paths above do. `mmt` is the
 /// thread count to pass, or `None` for the CLI's own default (every thread).
-fn oracle_7zz(path: &Path, mmt: Option<u32>) -> Option<Duration> {
+fn oracle_7zz(path: &Path, mmt: Option<u32>, password: Option<&str>) -> Option<Duration> {
     let mmt = mmt.map(|n| format!("-mmt={n}"));
     let start = Instant::now();
     let mut command = Command::new("7zz");
@@ -295,6 +310,12 @@ fn oracle_7zz(path: &Path, mmt: Option<u32>) -> Option<Duration> {
     if let Some(flag) = &mmt {
         command.arg(flag);
     }
+    // `7zz` prompts when an encrypted archive gets no password, which in a
+    // benchmark would hang rather than fail.
+    command.arg(match password {
+        Some(p) => format!("-p{p}"),
+        None => "-p".to_string(),
+    });
     let status = command
         .arg(path)
         .stdout(Stdio::null())
@@ -309,7 +330,14 @@ fn median(mut times: Vec<Duration>) -> Duration {
     times[times.len() / 2]
 }
 
-fn bench_one(path: &Path, runs: usize, oracle: bool, only: &str, threads: &[u32]) {
+fn bench_one(
+    path: &Path,
+    runs: usize,
+    oracle: bool,
+    only: &str,
+    threads: &[u32],
+    password: Option<&str>,
+) {
     let wanted = |name: &str| only.is_empty() || only == name;
     let compressed = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     println!(
@@ -345,7 +373,7 @@ fn bench_one(path: &Path, runs: usize, oracle: bool, only: &str, threads: &[u32]
             for _ in 0..runs {
                 print!("  {label} …");
                 let _ = std::io::stdout().flush();
-                match oracle_7zz(path, mmt) {
+                match oracle_7zz(path, mmt, password) {
                     Some(elapsed) => times.push(elapsed),
                     None => {
                         println!("\r  {label}: unavailable          ");
@@ -367,7 +395,7 @@ fn bench_one(path: &Path, runs: usize, oracle: bool, only: &str, threads: &[u32]
         // for today, and the crate does not scale past it on these fixtures.
         rows.push(time_it(
             "sevenz-rust2 0.22.2 @16".to_string(),
-            Box::new(|| extract_upstream(path, 16)),
+            Box::new(|| extract_upstream(path, 16, password)),
         ));
     }
 
@@ -375,13 +403,13 @@ fn bench_one(path: &Path, runs: usize, oracle: bool, only: &str, threads: &[u32]
         for &count in threads {
             rows.push(time_it(
                 format!("sevenz-fast @{count}"),
-                Box::new(move || extract_fork(path, count)),
+                Box::new(move || extract_fork(path, count, password)),
             ));
         }
         if let Some(&count) = threads.last() {
             rows.push(time_it(
                 format!("sevenz-fast @{count} no crc"),
-                Box::new(move || extract_fork_with(path, count, false)),
+                Box::new(move || extract_fork_with(path, count, false, password)),
             ));
         }
     }
