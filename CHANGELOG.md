@@ -9,11 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 `sevenz-turbo` began as a fork of
 [sevenz-rust2](https://github.com/hasenbanck/sevenz-rust2), taken at its
-commit `12ed7c8` (post-v0.22.2), and has since diverged for good: it is not
-rebased onto sevenz-rust2 and nothing goes back. This section is the record
-of how it differs from that commit, kept for readers who know the other
-crate. sevenz-rust2's own changelog up to the fork point continues below,
-unchanged.
+commit `12ed7c8` (post-v0.22.2). A permanent fork was not the plan: the codec
+swap and the container API were offered to sevenz-rust2 for merging, so that
+one crate could carry both, and the offer was declined - see
+[hasenbanck/sevenz-rust2#144](https://github.com/hasenbanck/sevenz-rust2/issues/144#issuecomment-5734631210).
+That left a hard fork as the only way to ship the work, and the two crates
+have diverged for good since: this one is not rebased onto sevenz-rust2 and
+nothing goes back. This section is the record of how it differs from the
+commit it was taken at, kept for readers who know the other crate.
+sevenz-rust2's own changelog up to the fork point continues below, unchanged.
 
 ### Packaging
 
