@@ -486,3 +486,70 @@ fn compress_path_does_not_emit_root_dir_entry() {
     assert!(names.iter().any(|n| n == "sub"));
     assert!(names.iter().any(|n| n == "sub/file2.txt"));
 }
+
+/// A source that hands out its bytes in small, uneven reads, so that the
+/// coder chain sees many writes and never one large one.
+#[cfg(feature = "compress")]
+struct Trickle<'a> {
+    data: &'a [u8],
+    pos: usize,
+    step: usize,
+}
+
+#[cfg(feature = "compress")]
+impl Read for Trickle<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = buf.len().min(self.step).min(self.data.len() - self.pos);
+        buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+        self.pos += n;
+        self.step = (self.step * 7 + 3) % 4099 + 1;
+        Ok(n)
+    }
+}
+
+/// Entries larger than the encoder's input chunk, fed in small reads, come
+/// back intact through each LZMA coder: raw LZMA, solid LZMA2, and LZMA2 in
+/// parallel blocks.
+#[cfg(feature = "compress")]
+#[test]
+fn large_entries_stream_through_the_lzma_coders() {
+    let content: Vec<u8> = (0..(6usize << 20))
+        .map(|i| {
+            ((i % 253) as u8)
+                .wrapping_mul(31)
+                .wrapping_add((i >> 12) as u8)
+        })
+        .collect();
+
+    let mut lzma2_mt = Lzma2Options::from_level_mt(3, 3, 1 << 20);
+    lzma2_mt.set_dictionary_size(1 << 20);
+    let configs: [EncoderConfiguration; 3] = [
+        LzmaOptions::from_level(3).into(),
+        Lzma2Options::from_level(3).into(),
+        lzma2_mt.into(),
+    ];
+
+    for config in configs {
+        let name = config.method.name();
+        let mut bytes = Vec::new();
+        {
+            let mut writer = ArchiveWriter::new(Cursor::new(&mut bytes)).unwrap();
+            writer.set_content_methods(vec![config]);
+            let source = Trickle {
+                data: &content,
+                pos: 0,
+                step: 1,
+            };
+            writer
+                .push_archive_entry(ArchiveEntry::new_file("large.bin"), Some(source))
+                .unwrap();
+            writer.finish().unwrap();
+        }
+        assert!(bytes.len() < content.len() / 4, "{name}: did not compress");
+
+        let mut reader =
+            ArchiveReader::new(Cursor::new(bytes.as_slice()), Password::empty()).unwrap();
+        let back = reader.read_file("large.bin").unwrap();
+        assert!(back == content, "{name}: round trip differs");
+    }
+}
