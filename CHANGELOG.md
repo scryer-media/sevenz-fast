@@ -7,10 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Fork
 
-`sevenz-turbo` is a fork of [sevenz-rust2](https://github.com/hasenbanck/sevenz-rust2)
-taken at upstream `12ed7c8` (post-v0.22.2). This section is the exhaustive list
-of how it differs from that commit, and it is the checklist a rebase is checked
-against. Upstream's own changelog continues below, unchanged.
+`sevenz-turbo` began as a fork of
+[sevenz-rust2](https://github.com/hasenbanck/sevenz-rust2), taken at its
+commit `12ed7c8` (post-v0.22.2), and has since diverged for good: it is not
+rebased onto sevenz-rust2 and nothing goes back. This section is the record
+of how it differs from that commit, kept for readers who know the other
+crate. sevenz-rust2's own changelog up to the fork point continues below,
+unchanged.
 
 ### Packaging
 
