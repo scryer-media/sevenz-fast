@@ -4,8 +4,9 @@
 //! (itself a fork of the unmaintained `sevenz-rust`). It differs from upstream
 //! in two ways, and the module paths and public API are otherwise upstream's:
 //!
-//! 1. LZMA and LZMA2 decode through [`lzma-turbo`](https://github.com/scryer-media/lzma-turbo),
-//!    a port of the 7-Zip reference decoder, instead of `lzma-rust2`.
+//! 1. LZMA and LZMA2 decode - and, with `compress`, encode - through
+//!    [`lzma-turbo`](https://github.com/scryer-media/lzma-turbo), a port of the
+//!    7-Zip reference coders, instead of `lzma-rust2`.
 //! 2. It adds the container API a streaming consumer needs: memory limits
 //!    enforced before allocation, per-member CRCs, folder-to-pack-stream byte
 //!    ranges, a borrowing reader, typed corruption errors carrying a block
