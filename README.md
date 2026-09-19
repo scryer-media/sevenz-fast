@@ -25,9 +25,10 @@ pure-Rust LZMA decoder published but still about 1.3x slower than 7-Zip
 single-threaded. This fork routes those two coders to
 [`lzma-turbo`](https://github.com/scryer-media/lzma-turbo), a port of Igor
 Pavlov's reference decoder (including the LZMA SDK's assembly loops) that is at
-parity with `7zz` single-threaded. `lzma-rust2` is no longer in the library's
-runtime dependency graph; it remains only behind the `compress` feature, whose
-encoders are what write archives.
+parity with `7zz` single-threaded. Archives are written with `lzma-turbo`'s
+encoder too, a port of the SDK's, so `lzma-rust2` is not in the dependency
+graph at all unless the `lzma-rust2-encoder` feature asks for its encoders
+instead.
 
 LZMA2 also decodes on several threads, by cutting the stream at the dictionary
 resets that make a run independently decodable. **The default is one thread**,
@@ -130,6 +131,15 @@ what it did, which keeps the migration a rename. See
 [CHANGELOG.md](CHANGELOG.md), section `## Fork`, for the record of
 divergences, and [AGENTS.md](AGENTS.md) for the rules of a crate that has
 left its origin behind.
+
+### Encoders
+
+Writing archives (`compress`) encodes LZMA and LZMA2 with `lzma-turbo`'s port
+of the SDK encoder. The alternative is `lzma-rust2`'s pure-Rust encoders,
+behind the `lzma-rust2-encoder` feature (off by default), which is what every
+version before 0.25.0 used; the option types and the archives are the same
+either way, only the compressed bytes differ. A compression level means the
+same dictionary under both: 256 KiB at level 0, doubling to 64 MiB at level 9.
 
 ### Crypto backends
 
@@ -375,11 +385,10 @@ named before the licence is.
   [`sevenz-rust2`](https://github.com/hasenbanck/sevenz-rust2), which is the
   code in this repository: the archive reader and writer, the coders, the
   encryption, the tests and the examples. He also wrote
-  [`lzma-rust2`](https://github.com/hasenbanck/lzma-rust2), whose BCJ, BCJ2
-  and delta filters are vendored here unchanged and whose encoders this crate
-  still uses to write archives. This fork is his work with two changes bolted
-  on, and if you are not sure you need those changes, his crate is the one to
-  use.
+  [`lzma-rust2`](https://github.com/hasenbanck/lzma-rust2), from which the
+  BCJ2 filter is vendored and whose encoders are the `lzma-rust2-encoder`
+  alternative. This fork is his work with two changes bolted on, and if you
+  are not sure you need those changes, his crate is the one to use.
 - **dyz1990** wrote the original
   [`sevenz-rust`](https://github.com/dyz1990/sevenz-rust) that `sevenz-rust2`
   continued, and with it the first 7z implementation in pure Rust.

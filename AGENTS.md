@@ -14,9 +14,10 @@ reasons:
 
 1. **Codec swap.** LZMA (`03 01 01`) and LZMA2 (`21`) decode through
    [`lzma-turbo`](https://github.com/scryer-media/lzma-turbo), a port of Igor
-   Pavlov's reference decoder, instead of `lzma-rust2`. `lzma-rust2` is not in
-   the library's runtime dependency graph; it remains only behind the
-   `compress` feature, whose encoders upstream needs for writing archives.
+   Pavlov's reference decoder, instead of `lzma-rust2`, and are encoded by
+   its port of the SDK encoder when archives are written. `lzma-rust2` is not
+   in the dependency graph unless the non-default `lzma-rust2-encoder`
+   feature asks for its encoders instead.
 2. **Container API.** The 7z detail a streaming consumer needs and upstream
    does not expose: memory limits enforced before allocation, per-member CRCs,
    folder-to-pack-stream byte ranges, a reader that parses once and decodes
@@ -44,15 +45,18 @@ with a version bump and a changelog entry like any other.
 
 ## Codec rules
 
-- LZMA and LZMA2 decoding is `lzma-turbo`'s, reached only through
-  `src/codec/lzma_turbo.rs`. Nothing else in the crate names `lzma_turbo::`.
-  That file is also where the multi-threaded LZMA2 coder lives; see
-  `docs/lzma-turbo-requests.md`.
+- LZMA and LZMA2 coding is `lzma-turbo`'s, reached only through
+  `src/codec/lzma_turbo.rs` (decoding, and the multi-threaded LZMA2 coder;
+  see `docs/lzma-turbo-requests.md`) and `src/codec/lzma_turbo/writer.rs`
+  (encoding: the `Write` bridge over its pull-driven encoders). Nothing else
+  in the crate names `lzma_turbo::` except the filter wrappers below. The
+  `lzma-rust2-encoder` feature swaps the encoders for `lzma-rust2`'s; the
+  option types in `src/encoder_options.rs` are encoder-agnostic so that the
+  swap is confined to `src/encoder.rs`.
 - The BCJ and delta filters are `lzma-turbo`'s (`lzma_turbo::filters`, behind
   its `filters` feature); `src/codec/filter/bcj.rs` and `delta.rs` are handles
   on them. BCJ2 is a 7z filter with no .xz equivalent and stays vendored from
-  `lzma-rust2` (Apache-2.0, see `src/codec/filter/mod.rs`), so the crate does
-  not carry `lzma-rust2` at runtime.
+  `lzma-rust2` (Apache-2.0, see `src/codec/filter/mod.rs`).
 - Crypto goes through `src/crypto_backend.rs` — SHA-256 *and* AES-256-CBC:
   `aws-lc-rs` by default, RustCrypto when the `native-crypto` feature is on.
   Never call a backend crate directly from anywhere else. The one exception is
