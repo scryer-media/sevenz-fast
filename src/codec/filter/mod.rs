@@ -1,4 +1,4 @@
-//! Branch/call/jump and delta filters, vendored.
+//! Branch/call/jump and delta filters.
 //!
 //! # Provenance
 //!
@@ -8,6 +8,13 @@
 //! decodes LZMA and LZMA2 with `lzma-turbo` instead, and vendoring the filters
 //! is what lets `lzma-rust2` leave the runtime dependency graph entirely
 //! rather than being carried for three filters.
+//!
+//! Two of the three no longer carry a converter of their own. `lzma-turbo`
+//! ports the same branch converters and the same delta filter from the same
+//! public-domain C, and is tested against the SDK's own harness for them, so
+//! `bcj` and `delta` keep only `lzma-rust2`'s readers and writers and put
+//! `lzma-turbo`'s filters underneath. BCJ2 is still vendored whole: it is a
+//! 7z filter with no .xz equivalent, so `lzma-turbo` has none.
 //!
 //! The only changes are mechanical, so a future re-sync stays a diff:
 //!

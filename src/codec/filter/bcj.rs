@@ -1,30 +1,79 @@
-//! Branch/Call/Jump Filters for executables of different architectures.
-
-mod arm;
-mod ia64;
-mod ppc;
-mod riscv;
-mod sparc;
-mod x86;
+//! Branch/call/jump filters, over `lzma-turbo`'s converters.
+//!
+//! The readers and writers below are still `lzma-rust2`'s, vendored (see the
+//! module doc a level up). What sat under them was a second port of the same
+//! eight converters from the same public-domain C, and `lzma-turbo` already
+//! carries one that is tested byte for byte against the SDK's own harness and
+//! is where this crate's LZMA comes from. Two ports of one filter is one too
+//! many, so `BcjFilter` is now a handle on that one.
+//!
+//! The contract lines up exactly: both convert in place, both return how many
+//! leading bytes they converted, and both expect the caller to carry the tail
+//! to the next call. The x86 converter's three bits of carried state live
+//! inside the handle, as they did here.
 
 use std::io::Read;
 #[cfg(feature = "compress")]
 use std::io::Write;
 
+use lzma_turbo::filters::bcj::{Bcj, BcjKind};
+
 pub(crate) struct BcjFilter {
     is_encoder: bool,
-    pos: usize,
-    prev_mask: u32,
-    filter: FilterFn,
+    bcj: Bcj,
 }
 
-type FilterFn = fn(filter: &mut BcjFilter, buf: &mut [u8]) -> usize;
-
 impl BcjFilter {
+    fn new(kind: BcjKind, start_pos: usize, is_encoder: bool) -> Self {
+        // Every call site starts at zero, and the constructor only refuses a
+        // start offset that is not a multiple of the converter's alignment,
+        // which zero always is. A start offset that does not fit a `u32` is
+        // the same kind of nonsense, and the filter is simply off for it.
+        let start = u32::try_from(start_pos).unwrap_or(0);
+        let bcj = Bcj::new(kind, start - (start % kind.alignment()))
+            .expect("the start offset was just rounded to the converter's alignment");
+        Self { is_encoder, bcj }
+    }
+
+    pub(crate) fn new_x86(start_pos: usize, encoder: bool) -> Self {
+        Self::new(BcjKind::X86, start_pos, encoder)
+    }
+
+    pub(crate) fn new_arm(start_pos: usize, encoder: bool) -> Self {
+        Self::new(BcjKind::Arm, start_pos, encoder)
+    }
+
+    pub(crate) fn new_arm_thumb(start_pos: usize, encoder: bool) -> Self {
+        Self::new(BcjKind::ArmThumb, start_pos, encoder)
+    }
+
+    pub(crate) fn new_arm64(start_pos: usize, encoder: bool) -> Self {
+        Self::new(BcjKind::Arm64, start_pos, encoder)
+    }
+
+    pub(crate) fn new_power_pc(start_pos: usize, encoder: bool) -> Self {
+        Self::new(BcjKind::Ppc, start_pos, encoder)
+    }
+
+    pub(crate) fn new_sparc(start_pos: usize, encoder: bool) -> Self {
+        Self::new(BcjKind::Sparc, start_pos, encoder)
+    }
+
+    pub(crate) fn new_ia64(start_pos: usize, encoder: bool) -> Self {
+        Self::new(BcjKind::Ia64, start_pos, encoder)
+    }
+
+    pub(crate) fn new_riscv(start_pos: usize, encoder: bool) -> Self {
+        Self::new(BcjKind::RiscV, start_pos, encoder)
+    }
+
     #[inline]
     pub(crate) fn code(&mut self, buf: &mut [u8]) -> usize {
-        let filter = self.filter;
-        filter(self, buf)
+        if self.is_encoder {
+            self.bcj.encode(buf)
+        } else {
+            self.bcj.decode(buf)
+        }
     }
 }
 
