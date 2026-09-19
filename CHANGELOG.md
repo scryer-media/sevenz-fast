@@ -375,6 +375,16 @@ Everything here is new surface; no upstream signature changed meaning.
   reading the binary fixtures `lzma-rust2` keeps in its repository, which are
   not ours to vendor.
 
+## 0.23.4 - 2026-09-18
+
+- Fixed: the `util` feature did not compile for `wasm32-unknown-unknown` unless
+  `compress` was also on. `src/util/wasm.rs`'s `compress` export names
+  `ArchiveWriter` and `SourceReader`, which live behind the `compress` feature,
+  and it was not gated on it. The export is now `#[cfg(feature = "compress")]`,
+  so a decode-only wasm guest built with `util` exports `decompress` alone. No
+  change to the `default_wasm` feature set's public API. A CI lane checks the
+  decode-only-with-`util` set so this cannot regress.
+
 ## 0.23.3 - 2026-09-18
 
 - New `crypto-host` feature and `sevenz_turbo::hooks` module: on a `wasm32`
