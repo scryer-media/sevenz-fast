@@ -302,8 +302,34 @@ Everything here is new surface; no upstream signature changed meaning.
   `aws-lc-crypto` nor `native-crypto` is a compile error. A consumer migrating
   from upstream with `default-features = false, features = ["aes256", …]` adds
   `"aws-lc-crypto"` to that list.
+- **A wasm guest can hand the block cipher to its host** (`crypto-host`, new
+  public module `sevenz_turbo::hooks`). On a `wasm32` target the feature routes
+  the bulk AES-256-CBC *decrypt* through a plain `fn` pointer the embedding
+  program installs; everything else — the SHA-256 key derivation, the
+  LZMA/LZMA2 decode, the CRCs — stays in the guest, and the public API is
+  unchanged. The hook takes `(key, iv, data)` and returns a fresh buffer of the
+  same length, unpadded, and is **stateless per call**: `HostAes256Cbc` in
+  `src/crypto_backend.rs` threads the CBC IV across chunks itself. A hook that
+  errors, answers with the wrong length, or was never installed panics; there
+  is no silent in-guest fallback, which would undo the delegation. Backend
+  precedence becomes host (wasm + `crypto-host`) > `native-crypto` > AWS-LC,
+  and on native targets the feature is accepted but inert, so feature
+  unification in a mixed workspace cannot turn a native build into a
+  delegating one. It adds no AES dependency — `aes256,crypto-host` without
+  `compress` carries no in-guest block cipher — and the seam mirrors
+  `rarpar`'s `unrar-rs` hooks module deliberately, so an embedder wires both
+  crates the same way.
+  FOLLOW-UP, deliberately not wired here: `lzma-turbo` is growing `crc-host` /
+  `crypto-host` hooks of its own on an unpublished branch. Once 0.3.6 is
+  released this crate gains `crc-host = ["lzma-turbo/crc-host"]` and
+  `crypto-host` forwards `lzma-turbo/crypto-host`, so the member CRC-32 and the
+  KDF's SHA-256 are delegated too. Until then `crypto-host` forwards
+  `lzma-turbo/native-crypto`, which is what gives a delegating wasm guest a
+  SHA-256 without a C toolchain and without dragging in `native-crypto`'s
+  `aes`/`cbc`.
 - New `sevenz_turbo::crypto_backend() -> &'static str`, reporting which backend
-  a build selected, for consumers who want to assert on it.
+  a build selected (`"aws-lc"`, `"rustcrypto"`, or `"host"` on a delegating
+  wasm build), for consumers who want to assert on it.
 - The `aes` and `cbc` dependencies are enabled by `native-crypto` (decryption)
   and by `compress` (encryption); the AWS-LC lane does not compile them. The
   direct `sha2` dependency is gone.
@@ -315,6 +341,17 @@ Everything here is new surface; no upstream signature changed meaning.
   against NIST on its own, block by block as well as in one call, and SHA-256
   against its own vectors. `7zAes.c`'s two special cycle counts (`0x3F`, `>= 0x40`) have tests of
   their own.
+- The host-delegated lane is proven twice. Natively, `HostAes256Cbc` is driven
+  through the real hook (a `fn` pointer links on any target) and compared with
+  the RustCrypto lane's one-shot answer at 1/2/3/5/13/64 blocks per call, which
+  is what pins the guest-tracked IV threading. In a real guest,
+  `tests/wasm_host_extract_conformance.rs` builds
+  `examples/wasm_host_extract_conformance.rs` for `wasm32-wasip1`, runs it
+  under `wasmtime` with a reference host AES, and asserts that its extraction
+  of a freshly written encrypted archive is byte-identical to the native
+  decoder's — and that a guest which never installs a hook panics with the
+  documented message. `wasmtime` is a dev-dependency of that harness only and
+  never enters the crate's dependency graph.
 
 ### Testing
 
@@ -337,6 +374,16 @@ Everything here is new surface; no upstream signature changed meaning.
 - The vendored BCJ round-trip tests generate their sample data instead of
   reading the binary fixtures `lzma-rust2` keeps in its repository, which are
   not ours to vendor.
+
+## 0.23.3 - 2026-09-18
+
+- New `crypto-host` feature and `sevenz_turbo::hooks` module: on a `wasm32`
+  target the bulk AES-256-CBC decrypt is delegated to a hook the embedding host
+  installs, so a guest with no AES-NI and no ARMv8 cryptography extensions does
+  not run the block cipher itself. Accepted but inert on native targets. See
+  the "WASM support" section of the README for the contract, and
+  `examples/wasm_host_extract_conformance.rs` for a complete reference
+  embedding.
 
 ## 0.23.2 - 2026-09-17
 

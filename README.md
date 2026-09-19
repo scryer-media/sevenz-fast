@@ -307,6 +307,60 @@ build for `wasm32`, so the WASM feature set uses the RustCrypto backend.
 RUSTFLAGS='--cfg getrandom_backend="wasm_js"' cargo build --target wasm32-unknown-unknown --no-default-features --features=default_wasm
 ```
 
+#### Letting the host do the AES (`crypto-host`)
+
+A wasm guest has neither AES-NI nor the ARMv8 cryptography extensions, so the
+block cipher is the one part of decoding an encrypted 7z archive that the
+embedding program can do several times faster than the guest. The `crypto-host`
+feature moves it there: on a `wasm32` target the bulk AES-256-CBC **decrypt**
+leaves the guest through a plain `fn` pointer the embedder installs.
+
+```bash
+RUSTFLAGS='--cfg getrandom_backend="wasm_js"' cargo build --target wasm32-unknown-unknown --no-default-features --features=aes256_wasm,crypto-host,bzip2,ppmd
+```
+
+Nothing else changes: the SHA-256 key derivation, the LZMA/LZMA2 decode and the
+CRCs stay in the guest, the public API is untouched, and the encoder keeps its
+own in-guest AES. The feature adds no AES dependency at all — a delegating build
+that does not also ask for `compress` carries no block cipher of its own.
+
+The embedder installs one hook before opening an encrypted archive:
+
+```rust,ignore
+use sevenz_turbo::hooks::{HostAesError, HostCryptoHooks, install_host_crypto_hooks};
+
+fn aes_cbc_decrypt(key: &[u8], iv: &[u8], data: &[u8]) -> Result<Vec<u8>, HostAesError> {
+    // forward to the embedder's AES-256-CBC (a raw wasm import, a component
+    // import, a host SDK call — `sevenz-turbo` never sees which)
+}
+
+install_host_crypto_hooks(HostCryptoHooks { aes_cbc_decrypt });
+```
+
+The contract the hook must satisfy:
+
+- It returns the AES-256-CBC decryption of `data` under `key`/`iv`, **no
+  padding**, as a fresh buffer of exactly `data.len()` bytes.
+- `key` is 32 bytes, `iv` is 16, `data` is a whole number of 16-byte blocks and
+  may be empty.
+- It is **stateless per call**: this crate threads the CBC IV across chunks
+  itself, so a host never carries cipher state between calls.
+- A hook that errors, answers with the wrong length, or was never installed is
+  an embedder contract violation and panics. There is no silent in-guest
+  fallback, because a fallback would quietly undo the delegation.
+
+`examples/wasm_host_extract_conformance.rs` is a complete reference embedding —
+a `wasm32-wasip1` guest that declares one raw import in a `host` namespace and
+forwards the hook to it — and `tests/wasm_host_extract_conformance.rs` is the
+native `wasmtime` harness that runs it: it writes an encrypted fixture archive,
+extracts it inside the guest through a reference host AES, and asserts the
+guest's bytes equal the native decoder's. `wasmtime` is a dev-dependency of that
+harness only and never enters the crate's dependency graph.
+
+On native targets `crypto-host` is accepted but inert: AWS-LC or RustCrypto
+stays selected and no hook is ever called, so feature unification in a mixed
+workspace cannot turn a native build into a delegating one.
+
 ## Acknowledgements
 
 Almost none of this crate is ours, and the people it belongs to should be

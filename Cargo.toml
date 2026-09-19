@@ -9,7 +9,7 @@ readme = "README.md"
 repository = "https://github.com/scryer-media/sevenz-turbo"
 # Raised from upstream's 1.93: `lzma-turbo` requires 1.97.1.
 rust-version = "1.97.1"
-version = "0.23.2"
+version = "0.23.3"
 # Repository scaffolding that has no business in the crate archive.
 exclude = [".github/", ".githooks/", ".gitleaks.toml", ".gitattributes", "renovate.json", "AGENTS.md", ".cargo/", "xtask/", "rust-toolchain.toml"]
 
@@ -39,6 +39,25 @@ aes256_wasm = ["aes256", "getrandom/wasm_js"]
 # `aes`/`cbc` in regardless of the backend.
 aws-lc-crypto = ["dep:aws-lc-rs", "lzma-turbo/crypto"]
 native-crypto = ["dep:aes", "dep:cbc", "lzma-turbo/native-crypto"]
+# Delegate the bulk AES-256-CBC *decrypt* to an embedder-installed hook (see
+# the `hooks` module) instead of running a block cipher inside the guest.
+# Engaged on `wasm32` only: on a native target the feature is accepted but
+# inert (AWS-LC or RustCrypto stays selected and no hook is ever called), so
+# feature unification in a mixed workspace cannot silently turn a native build
+# into a delegating one. It adds no AES dependency at all — that is the point:
+# `aes256,crypto-host` on wasm carries no in-guest block cipher. It does
+# forward `lzma-turbo/native-crypto`, because the 7z key derivation's SHA-256
+# is still computed in the guest and needs a backend that builds without a C
+# toolchain.
+#
+# FOLLOW-UP (wire once `lzma-turbo` 0.3.6 lands, not before): `lzma-turbo` is
+# growing its own `crc-host` / `crypto-host` hooks on branch
+# `feature/wasm-host-hooks`. When that is published, this crate gains a
+# `crc-host = ["lzma-turbo/crc-host"]` feature and `crypto-host` forwards
+# `lzma-turbo/crypto-host`, so a wasm guest delegates the member CRC-32 and the
+# KDF's SHA-256 as well. Deliberately NOT wired here: nothing may depend on an
+# unpublished branch of `lzma-turbo`.
+crypto-host = ["lzma-turbo/native-crypto"]
 brotli = ["dep:brotli"]
 bzip2 = ["dep:bzip2"]
 compress = ["dep:lzma-rust2", "dep:aes", "dep:cbc"]
@@ -80,6 +99,18 @@ wasm-bindgen = "0.2"
 rand = { version = "0.10" }
 tempfile = "3"
 
+# The `wasm_host_extract_conformance` integration test drives the wasm
+# `crypto-host` example through a native `wasmtime` host that supplies the
+# reference AES the example imports. These are native-only tooling for that
+# harness and MUST stay out of the wasm example build — hence the target gate.
+# `wasmtime` is a dev-dependency and nothing else: it never enters the crate's
+# own dependency graph.
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
+aes = "0.9"
+cbc = "0.2"
+wasmtime = "48"
+wasmtime-wasi = "48"
+
 [[example]]
 name = "advance"
 required-features = ["default"]
@@ -103,6 +134,13 @@ required-features = ["default"]
 [[example]]
 name = "mt_decompress"
 required-features = ["default"]
+
+# The reference embedding of the `hooks` seam: a wasm guest that declares a raw
+# import in a `host` namespace and installs a hook forwarding to it. It only
+# makes sense with the delegating feature on.
+[[example]]
+name = "wasm_host_extract_conformance"
+required-features = ["aes256", "crypto-host"]
 
 [package.metadata.docs.rs]
 all-features = true

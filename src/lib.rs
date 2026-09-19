@@ -69,6 +69,12 @@ mod encryption;
 pub fn crypto_backend() -> &'static str {
     crypto_backend::BACKEND
 }
+/// Embedder-supplied delegation hooks for the bulk AES-256-CBC decrypt
+/// (the `crypto-host` feature). See the module documentation for the contract
+/// a host must satisfy.
+#[cfg(all(feature = "aes256", feature = "crypto-host"))]
+pub mod hooks;
+
 mod error;
 mod reader;
 

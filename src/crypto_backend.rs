@@ -45,6 +45,33 @@
 //! The encoder (`compress` + `aes256`) stays on RustCrypto's `cbc::Encryptor`
 //! in `encryption::aes`: writing archives is not the hot path this fork
 //! exists for, and one encryptor is simpler than two.
+//!
+//! # The host-delegated backend (`crypto-host`, wasm only)
+//!
+//! A third choice exists for wasm embeddings: with `crypto-host` enabled on a
+//! `wasm32` target, the bulk AES-256-CBC **decrypt** leaves the guest and runs
+//! on the embedder's AES through a plain `fn` pointer hook (see
+//! [`crate::hooks`]). A wasm guest has neither AES-NI nor the ARMv8
+//! cryptography extensions, so the block cipher is the one part of 7z decoding
+//! a host can do several times faster; everything else — the key derivation,
+//! the LZMA/LZMA2 decode, the CRCs — stays in the guest where it belongs.
+//!
+//! Precedence is **host (wasm + `crypto-host`) > `native-crypto` > AWS-LC**.
+//! On a native target `crypto-host` is accepted but inert: the in-process
+//! backend stays selected and no hook is ever called, so feature unification
+//! in a mixed workspace cannot silently turn a native build into a delegating
+//! one. `crypto-host` pulls in neither `aes` nor `cbc` — a delegating wasm
+//! build carries no in-guest AES at all — but it does forward
+//! `lzma-turbo/native-crypto`, because SHA-256 for the 7z key derivation is
+//! still computed in the guest (see the feature comment in `Cargo.toml`).
+//!
+//! The hook is stateless per call, so [`HostAes256Cbc`] threads the CBC IV
+//! across chunks itself: before each in-place decrypt it copies out the
+//! chunk's last *ciphertext* block, which is the next chunk's IV. That is
+//! exactly what the stateful AWS-LC and RustCrypto contexts do internally,
+//! only written out — and the differential test at the bottom of this file
+//! proves it against the RustCrypto lane natively, with no wasm runtime in
+//! sight.
 
 #[cfg(feature = "native-crypto")]
 use aes::Aes256;
@@ -55,22 +82,42 @@ use aws_lc_rs::cipher::{AES_256, DecryptingKey, DecryptionContext, UnboundCipher
 #[cfg(feature = "aws-lc-crypto")]
 use aws_lc_rs::iv::FixedLength;
 
-#[cfg(all(feature = "aws-lc-crypto", not(feature = "native-crypto")))]
+// SHA-256 stays in-process on every lane, including the host-delegated one:
+// `crypto-host` forwards `lzma-turbo/native-crypto`, so a delegating wasm
+// guest has RustCrypto's SHA-256 without needing this crate's `native-crypto`
+// (which would also drag `aes`/`cbc` in). Delegating SHA-256 as well is a
+// follow-up that waits on `lzma-turbo`'s own host hooks.
+#[cfg(all(
+    feature = "aws-lc-crypto",
+    not(feature = "native-crypto"),
+    not(all(target_arch = "wasm32", feature = "crypto-host"))
+))]
 pub(crate) use lzma_turbo::crypto::awslc::Sha256;
-#[cfg(feature = "native-crypto")]
+#[cfg(any(
+    feature = "native-crypto",
+    all(target_arch = "wasm32", feature = "crypto-host")
+))]
 pub(crate) use lzma_turbo::crypto::rustcrypto::Sha256;
 
-#[cfg(not(any(feature = "aws-lc-crypto", feature = "native-crypto")))]
+#[cfg(not(any(
+    feature = "aws-lc-crypto",
+    feature = "native-crypto",
+    all(target_arch = "wasm32", feature = "crypto-host")
+)))]
 compile_error!(
     "the `aes256` feature needs a SHA-256 backend: enable `aws-lc-crypto` \
-     (the default, AWS-LC) or `native-crypto` (RustCrypto, no C toolchain)"
+     (the default, AWS-LC) or `native-crypto` (RustCrypto, no C toolchain). \
+     On wasm32, `crypto-host` also satisfies this: it delegates AES to the \
+     embedder and keeps RustCrypto's SHA-256 in the guest"
 );
 
 /// Which cryptography backend this build selected, for SHA-256 and for
 /// AES-256-CBC alike. Only used by tests and
 /// diagnostics, but a consumer wondering what is in their binary should be
 /// able to ask.
-pub(crate) const BACKEND: &str = if cfg!(feature = "native-crypto") {
+pub(crate) const BACKEND: &str = if cfg!(all(target_arch = "wasm32", feature = "crypto-host")) {
+    "host"
+} else if cfg!(feature = "native-crypto") {
     "rustcrypto"
 } else {
     "aws-lc"
@@ -211,11 +258,95 @@ impl Aes256CbcLike for RustCryptoAes256Cbc {
     }
 }
 
-/// The cipher this build selected, under one name. `native-crypto` takes
-/// precedence exactly as it does for SHA-256.
-#[cfg(feature = "native-crypto")]
+/// AES-256-CBC delegated to the embedding host (see [`crate::hooks`]).
+///
+/// Compiled whenever `crypto-host` is enabled — on native targets too, where
+/// it is not the selected backend but is driven by the differential test below
+/// through the very same hook a wasm embedder installs. `fn` pointers link on
+/// any target, so that test is the real delegation path, not a stand-in.
+///
+/// The key is held raw because the hook takes it by slice on every call; there
+/// is no key schedule to build once, since the host owns the cipher.
+#[cfg(feature = "crypto-host")]
+#[cfg_attr(
+    not(all(target_arch = "wasm32", feature = "crypto-host")),
+    allow(dead_code)
+)]
+pub(crate) struct HostAes256Cbc {
+    key: [u8; AES256_KEY_LEN],
+    iv: [u8; AES_BLOCK_LEN],
+}
+
+#[cfg(feature = "crypto-host")]
+impl std::fmt::Debug for HostAes256Cbc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never print key or chaining state.
+        f.write_str("HostAes256Cbc(..)")
+    }
+}
+
+#[cfg(feature = "crypto-host")]
+impl Aes256CbcLike for HostAes256Cbc {
+    fn new(key: &[u8], iv: &[u8]) -> Result<Self, AesError> {
+        let key: [u8; AES256_KEY_LEN] = key.try_into().map_err(|_| AesError::KeyLength)?;
+        let iv: [u8; AES_BLOCK_LEN] = iv.try_into().map_err(|_| AesError::IvLength)?;
+        Ok(Self { key, iv })
+    }
+
+    fn decrypt(&mut self, data: &mut [u8]) -> Result<(), AesError> {
+        if !data.len().is_multiple_of(AES_BLOCK_LEN) {
+            return Err(AesError::BlockAlignment);
+        }
+        if data.is_empty() {
+            return Ok(());
+        }
+        // The hook is stateless, so the IV for the next chunk has to be saved
+        // here — and *before* the decrypt, which overwrites the ciphertext.
+        let mut next_iv = [0u8; AES_BLOCK_LEN];
+        next_iv.copy_from_slice(&data[data.len() - AES_BLOCK_LEN..]);
+
+        // A hook that refuses a call this crate made, or answers with the
+        // wrong number of bytes, is an embedder contract violation: the guest
+        // asked for whole blocks under a 32-byte key and a 16-byte IV. There
+        // is nothing to fall back to and nothing to report up the stack that a
+        // caller could act on, so it panics rather than corrupting a decode.
+        let hooks = crate::hooks::hooks();
+        let plaintext = match (hooks.aes_cbc_decrypt)(&self.key, &self.iv, data) {
+            Ok(plaintext) => plaintext,
+            Err(err) => {
+                panic!("sevenz-turbo: host aes-cbc-decrypt failed: {err} (contract violation)")
+            }
+        };
+        assert_eq!(
+            plaintext.len(),
+            data.len(),
+            "sevenz-turbo: host aes-cbc-decrypt returned {} bytes for a {}-byte input \
+             (contract violation)",
+            plaintext.len(),
+            data.len(),
+        );
+        data.copy_from_slice(&plaintext);
+
+        self.iv = next_iv;
+        Ok(())
+    }
+}
+
+/// The cipher this build selected, under one name. The host-delegated backend
+/// wins on a `wasm32` build with `crypto-host`; otherwise `native-crypto`
+/// takes precedence exactly as it does for SHA-256.
+#[cfg(all(target_arch = "wasm32", feature = "crypto-host"))]
+pub(crate) type Aes256Cbc = HostAes256Cbc;
+#[cfg(all(
+    feature = "native-crypto",
+    not(all(target_arch = "wasm32", feature = "crypto-host"))
+))]
 pub(crate) type Aes256Cbc = RustCryptoAes256Cbc;
-#[cfg(all(feature = "aws-lc-crypto", not(feature = "native-crypto")))]
+#[cfg(all(
+    feature = "aws-lc-crypto",
+    not(feature = "native-crypto"),
+    not(all(target_arch = "wasm32", feature = "crypto-host"))
+))]
 pub(crate) type Aes256Cbc = AwsLcAes256Cbc;
 
 /// The shape both backends' SHA-256 share, so the key derivation can be
@@ -247,9 +378,18 @@ macro_rules! impl_sha256_like {
     };
 }
 
-#[cfg(feature = "aws-lc-crypto")]
+#[cfg(all(
+    feature = "aws-lc-crypto",
+    not(all(target_arch = "wasm32", feature = "crypto-host"))
+))]
 impl_sha256_like!(lzma_turbo::crypto::awslc::Sha256);
-#[cfg(feature = "native-crypto")]
+// `crypto-host` forwards `lzma-turbo/native-crypto`, so the RustCrypto hash is
+// present on a delegating wasm build even without this crate's own
+// `native-crypto`.
+#[cfg(any(
+    feature = "native-crypto",
+    all(target_arch = "wasm32", feature = "crypto-host")
+))]
 impl_sha256_like!(lzma_turbo::crypto::rustcrypto::Sha256);
 
 #[cfg(test)]
@@ -508,6 +648,131 @@ mod tests {
                 let b = derive_key_with::<rustcrypto::Sha256>(cycles, salt, password);
                 assert_eq!(a, b, "backends disagree at cycles {cycles}");
             }
+        }
+    }
+
+    /// The host-delegated lane, driven NATIVELY through the real hook.
+    ///
+    /// `crypto-host` is inert on a native target — `Aes256Cbc` is still the
+    /// in-process backend there — but [`HostAes256Cbc`] itself compiles and
+    /// the hook is a plain `fn` pointer, so the whole delegation path can be
+    /// exercised here without a wasm runtime: registry lookup, the fresh
+    /// buffer the hook returns, the copy back, and above all the guest-tracked
+    /// CBC IV threading across chunk boundaries. The wasm harness in
+    /// `tests/wasm_host_extract_conformance.rs` separately proves the same
+    /// path links and extracts a real archive inside a guest.
+    ///
+    /// Needs `native-crypto` only for the reference hook's own AES.
+    #[cfg(all(feature = "crypto-host", feature = "native-crypto"))]
+    mod host_delegation {
+        use super::{
+            AES_BLOCK_LEN, AES256_KEY_LEN, Aes256CbcLike, AesError, HostAes256Cbc,
+            RustCryptoAes256Cbc,
+            tests::{NIST_CIPHERTEXT, NIST_IV, NIST_KEY, NIST_PLAINTEXT, hex, unhex},
+        };
+        use crate::hooks::test_reference;
+
+        fn sample(len: usize, seed: u64) -> Vec<u8> {
+            let mut state = seed | 1;
+            (0..len)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    (state >> 24) as u8
+                })
+                .collect()
+        }
+
+        /// The NIST vector through the hook, one shot.
+        #[test]
+        fn the_host_lane_matches_the_nist_vector() {
+            test_reference::install();
+            let mut data = unhex(NIST_CIPHERTEXT);
+            HostAes256Cbc::new(&unhex(NIST_KEY), &unhex(NIST_IV))
+                .expect("key and iv are sized")
+                .decrypt(&mut data)
+                .expect("aligned ciphertext");
+            assert_eq!(hex(&data), NIST_PLAINTEXT);
+        }
+
+        /// The load-bearing one: a stateless hook means the IV is threaded by
+        /// this crate, so every block-aligned way of slicing the same stream
+        /// has to come out identical to the in-process backend's one-shot
+        /// answer. Uneven chunk sizes are what a 7z reader actually produces.
+        #[test]
+        fn the_host_lane_chains_the_iv_like_the_in_process_backend() {
+            test_reference::install();
+            let key = sample(32, 51);
+            let iv = sample(AES_BLOCK_LEN, 52);
+            let data = sample(64 * AES_BLOCK_LEN, 53);
+
+            let mut oneshot = data.clone();
+            RustCryptoAes256Cbc::new(&key, &iv)
+                .expect("sized")
+                .decrypt(&mut oneshot)
+                .expect("aligned");
+
+            for chunk_blocks in [1usize, 2, 3, 5, 13, 64] {
+                let mut host = HostAes256Cbc::new(&key, &iv).expect("sized");
+                let mut out = Vec::new();
+                for piece in data.chunks(chunk_blocks * AES_BLOCK_LEN) {
+                    let mut piece = piece.to_vec();
+                    host.decrypt(&mut piece).expect("aligned");
+                    out.extend_from_slice(&piece);
+                }
+                assert_eq!(
+                    out, oneshot,
+                    "host lane diverged in {chunk_blocks}-block chunks"
+                );
+            }
+        }
+
+        /// An empty call must not disturb the chaining state — a coder below
+        /// can hand over zero bytes — and a partial block is refused before
+        /// the hook is ever reached, so a host never sees a call this crate's
+        /// own contract forbids.
+        #[test]
+        fn empty_and_misaligned_chunks_behave_like_the_other_lanes() {
+            test_reference::install();
+            let key = sample(32, 61);
+            let iv = sample(AES_BLOCK_LEN, 62);
+            let data = sample(4 * AES_BLOCK_LEN, 63);
+
+            let mut expected = data.clone();
+            RustCryptoAes256Cbc::new(&key, &iv)
+                .expect("sized")
+                .decrypt(&mut expected)
+                .expect("aligned");
+
+            let mut host = HostAes256Cbc::new(&key, &iv).expect("sized");
+            host.decrypt(&mut []).expect("empty is fine");
+            let mut got = data.clone();
+            host.decrypt(&mut got).expect("aligned");
+            assert_eq!(got, expected);
+
+            let mut half = sample(AES_BLOCK_LEN + 1, 64);
+            assert_eq!(
+                HostAes256Cbc::new(&key, &iv)
+                    .expect("sized")
+                    .decrypt(&mut half),
+                Err(AesError::BlockAlignment)
+            );
+        }
+
+        /// A wrong-sized key or IV is refused where the other lanes refuse it:
+        /// in `new`, with the same error, so the hook only ever sees the sizes
+        /// its contract names.
+        #[test]
+        fn the_host_lane_refuses_a_wrong_sized_key_or_iv() {
+            assert_eq!(
+                HostAes256Cbc::new(&[0u8; 16], &[0u8; AES_BLOCK_LEN]).err(),
+                Some(AesError::KeyLength)
+            );
+            assert_eq!(
+                HostAes256Cbc::new(&[0u8; AES256_KEY_LEN], &[0u8; 8]).err(),
+                Some(AesError::IvLength)
+            );
         }
     }
 }

@@ -128,6 +128,42 @@ jobs:
       - name: Test the RustCrypto backend
         run: cargo test --locked --no-default-features --features aes256,native-crypto,bzip2,compress,ppmd,util --no-fail-fast
 
+  wasm:
+    name: wasm
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: wasm32-unknown-unknown, wasm32-wasip1
+      # The browser feature set: no C toolchain there, so RustCrypto for
+      # SHA-256 and AES alike. This is the command the README documents.
+      - name: Check the wasm feature set
+        run: cargo check --locked --target wasm32-unknown-unknown --no-default-features --features default_wasm
+        env:
+          RUSTFLAGS: --cfg getrandom_backend="wasm_js"
+      # The same set plus `crypto-host`, which moves the bulk AES-256-CBC
+      # decrypt out to the embedding host.
+      - name: Check the wasm feature set with the host-delegated AES
+        run: cargo check --locked --target wasm32-unknown-unknown --no-default-features --features aes256_wasm,crypto-host,native-crypto,bzip2,compress,ppmd,util
+        env:
+          RUSTFLAGS: --cfg getrandom_backend="wasm_js"
+      # Decode-only and delegating: the configuration a wasm embedder actually
+      # ships, which carries no in-guest block cipher at all.
+      - name: Check the delegating wasm guest without an in-guest AES
+        run: cargo check --locked --target wasm32-unknown-unknown --no-default-features --features aes256_wasm,crypto-host,bzip2,ppmd
+        env:
+          RUSTFLAGS: --cfg getrandom_backend="wasm_js"
+      # The conformance harness builds the wasm32-wasip1 guest example itself
+      # and runs it under `wasmtime` with a reference host AES, comparing the
+      # guest's extraction with the native decoder's.
+      - name: Run the wasm host-AES conformance harness
+        run: cargo test --locked --test wasm_host_extract_conformance
+
   msrv:
     name: msrv
     runs-on: ubuntu-24.04
@@ -167,7 +203,7 @@ jobs:
   ci-complete:
     name: ci-complete
     if: always()
-    needs: [hygiene, fmt, clippy, docs, test, msrv, package]
+    needs: [hygiene, fmt, clippy, docs, test, wasm, msrv, package]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
