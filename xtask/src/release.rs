@@ -1,7 +1,8 @@
 //! `cargo xtask release`: run the checks the release workflow runs, create the
 //! signed tag and push it. `.github/workflows/release.yml` publishes to
-//! crates.io and creates the GitHub release when the tag arrives. See
-//! `docs/publishing.md`.
+//! crates.io and creates the GitHub release when the tag arrives. The same
+//! workflow can also be dispatched from the Actions tab, which needs no local
+//! tag at all; see `docs/publishing.md`.
 
 use std::{env, process::ExitCode};
 
