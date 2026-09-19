@@ -553,3 +553,58 @@ fn large_entries_stream_through_the_lzma_coders() {
         assert!(back == content, "{name}: round trip differs");
     }
 }
+
+/// A dictionary that is not one the LZMA2 property byte can name exactly is
+/// rounded up, never down: the decoder gets at least the window the encoder
+/// used, and an entry that leans on all of it comes back.
+#[cfg(feature = "compress")]
+#[test]
+fn a_non_canonical_lzma2_dictionary_round_trips() {
+    // 5 MiB sits between the table's 4 MiB and 6 MiB. The entry is a block
+    // that repeats 4.5 MiB later, so every match reaches past 4 MiB.
+    let block: Vec<u8> = (0..(1usize << 19))
+        .map(|i| ((i * 2654435761usize) >> 13) as u8)
+        .collect();
+    let mut content = block.clone();
+    content.extend((0..(4usize << 20)).map(|i| (i % 7) as u8));
+    content.extend_from_slice(&block);
+
+    let mut options = Lzma2Options::from_level(3);
+    options.set_dictionary_size(5 << 20);
+    let mut bytes = Vec::new();
+    {
+        let mut writer = ArchiveWriter::new(Cursor::new(&mut bytes)).unwrap();
+        writer.set_content_methods(vec![options.into()]);
+        writer
+            .push_archive_entry(
+                ArchiveEntry::new_file("far.bin"),
+                Some(Cursor::new(content.as_slice())),
+            )
+            .unwrap();
+        writer.finish().unwrap();
+    }
+    let mut reader = ArchiveReader::new(Cursor::new(bytes.as_slice()), Password::empty()).unwrap();
+    assert!(reader.read_file("far.bin").unwrap() == content);
+}
+
+/// A chunk size of zero means "the dictionary", as it always has, and still
+/// compresses in parallel blocks rather than being refused or going solid.
+#[cfg(feature = "compress")]
+#[test]
+fn a_zero_chunk_size_means_the_dictionary() {
+    let content: Vec<u8> = (0..(3usize << 20)).map(|i| (i % 251) as u8).collect();
+    let mut bytes = Vec::new();
+    {
+        let mut writer = ArchiveWriter::new(Cursor::new(&mut bytes)).unwrap();
+        writer.set_content_methods(vec![Lzma2Options::from_level_mt(1, 2, 0).into()]);
+        writer
+            .push_archive_entry(
+                ArchiveEntry::new_file("blocks.bin"),
+                Some(Cursor::new(content.as_slice())),
+            )
+            .unwrap();
+        writer.finish().unwrap();
+    }
+    let mut reader = ArchiveReader::new(Cursor::new(bytes.as_slice()), Password::empty()).unwrap();
+    assert!(reader.read_file("blocks.bin").unwrap() == content);
+}

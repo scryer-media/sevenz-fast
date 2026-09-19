@@ -397,6 +397,10 @@ Everything here is new surface; no upstream signature changed meaning.
   64 MiB at level 9, rather than the SDK's own level defaults. The public
   API does not change.
 - Requires `lzma-turbo` 0.4.0 with its `enc` feature.
+- Fixed: the LZMA2 property byte for a dictionary that is not a power of
+  two or three times one was rounded down (5 MiB was written as 4 MiB) while
+  the encoder used the full window, so a reader could hit a match beyond its
+  dictionary. It is now rounded up, as `Lzma2Enc_WriteProperties` does.
 
 ## 0.24.0 - 2026-09-18
 

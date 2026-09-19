@@ -217,6 +217,21 @@ fn validate_lzma_dictionary_size(dict_size: u32) -> Result<(), Error> {
     Ok(())
 }
 
+/// The LZMA2 property byte for `dict_size`: the smallest of the table's 41
+/// dictionaries that is at least as large.
+///
+/// The encoder's window is exactly `dict_size`, so the byte must never name a
+/// smaller dictionary, or a decoder allocates less than a match can reach
+/// back over. A size that is not a power of two or three times one is rounded
+/// up, as `Lzma2Enc_WriteProperties` does.
+fn lzma2_property_for(dict_size: u32) -> u8 {
+    (0..=40u8)
+        .find(|&prop| {
+            crate::codec::lzma_turbo::lzma2_dictionary_size(&[prop]).is_ok_and(|d| d >= dict_size)
+        })
+        .unwrap_or(40)
+}
+
 pub(crate) fn add_encoder<W: Write>(
     input: CountingWriter<W>,
     method_config: &EncoderConfiguration,
@@ -406,11 +421,7 @@ pub(crate) fn get_options_as_properties<'a>(
                 Some(EncoderOptions::Lzma2(options)) => options,
                 _ => &Lzma2Options::default(),
             };
-            let dict_size = options.settings.dict_size();
-            let lead = dict_size.leading_zeros();
-            let second_bit = (dict_size >> (30u32.wrapping_sub(lead))).wrapping_sub(2);
-            let prop = (19u32.wrapping_sub(lead) * 2 + second_bit) as u8;
-            out[0] = prop;
+            out[0] = lzma2_property_for(options.settings.dict_size());
             &out[0..1]
         }
         EncoderMethod::ID_LZMA => {
@@ -481,5 +492,37 @@ pub(crate) fn get_options_as_properties<'a>(
             &out[..34]
         }
         _ => &[],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lzma2_property_for;
+    use crate::codec::lzma_turbo::lzma2_dictionary_size;
+
+    #[test]
+    fn the_lzma2_property_never_names_a_smaller_dictionary() {
+        for dict in [
+            4096u32,
+            1 << 18,
+            (1 << 20) + 1,
+            3 << 20,
+            5 << 20,
+            (3 << 20) + 1,
+            1 << 26,
+            (1 << 30) - 1,
+            u32::MAX,
+        ] {
+            let prop = lzma2_property_for(dict);
+            let named = lzma2_dictionary_size(&[prop]).unwrap();
+            assert!(named >= dict, "{dict}: property {prop} names {named}");
+            if prop > 0 {
+                let below = lzma2_dictionary_size(&[prop - 1]).unwrap();
+                assert!(below < dict, "{dict}: property {} would do", prop - 1);
+            }
+        }
+        assert_eq!(lzma2_property_for(1 << 20), 16);
+        assert_eq!(lzma2_property_for(3 << 20), 19);
+        assert_eq!(lzma2_property_for(5 << 20), 21);
     }
 }

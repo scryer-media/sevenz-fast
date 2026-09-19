@@ -228,7 +228,9 @@ impl Lzma2Options {
         Self {
             settings: LzmaSettings::from_level(level),
             threads,
-            chunk_size: NonZeroU64::new(chunk_size),
+            // Zero is "the dictionary's size", as it always was:
+            // `block_size` raises anything smaller to the dictionary.
+            chunk_size: NonZeroU64::new(chunk_size.max(1)),
         }
     }
 
