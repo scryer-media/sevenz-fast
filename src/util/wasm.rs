@@ -77,6 +77,11 @@ fn sanitize_entry_name(entry_name: &str) -> Result<String, String> {
 /// # Arguments
 /// * `entries` - Vector of JavaScript strings representing file names/paths
 /// * `datas` - Vector of Uint8Arrays containing the file data corresponding to entries
+///
+/// Present only with the `compress` feature: the writer half of the crate
+/// (`ArchiveWriter`, `SourceReader`) lives behind it, so a decode-only wasm guest
+/// built with `util` exports `decompress` and nothing else.
+#[cfg(feature = "compress")]
 #[wasm_bindgen]
 pub fn compress(entries: Vec<JsString>, datas: Vec<Uint8Array>) -> Result<Uint8Array, String> {
     let output = Uint8Array::new_with_length(32);

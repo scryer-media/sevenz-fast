@@ -307,6 +307,10 @@ build for `wasm32`, so the WASM feature set uses the RustCrypto backend.
 RUSTFLAGS='--cfg getrandom_backend="wasm_js"' cargo build --target wasm32-unknown-unknown --no-default-features --features=default_wasm
 ```
 
+The `util` feature's `wasm-bindgen` exports follow the feature set: `decompress`
+is there whenever `util` is, and `compress` only when the `compress` feature is
+on as well, so a decode-only guest builds without the writer half of the crate.
+
 #### Letting the host do the AES (`crypto-host`)
 
 A wasm guest has neither AES-NI nor the ARMv8 cryptography extensions, so the

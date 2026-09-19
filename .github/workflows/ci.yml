@@ -153,9 +153,17 @@ jobs:
         env:
           RUSTFLAGS: --cfg getrandom_backend="wasm_js"
       # Decode-only and delegating: the configuration a wasm embedder actually
-      # ships, which carries no in-guest block cipher at all.
+      # ships, which carries no in-guest block cipher at all. Without `util`,
+      # so the crate is proven to build with no `wasm-bindgen` export surface.
       - name: Check the delegating wasm guest without an in-guest AES
         run: cargo check --locked --target wasm32-unknown-unknown --no-default-features --features aes256_wasm,crypto-host,bzip2,ppmd
+        env:
+          RUSTFLAGS: --cfg getrandom_backend="wasm_js"
+      # The same set with `util`: the `wasm-bindgen` surface compiles without
+      # `compress`, exporting `decompress` alone. This lane is why the `compress`
+      # half of `src/util/wasm.rs` is feature-gated.
+      - name: Check the delegating wasm guest with the decode-only util bindings
+        run: cargo check --locked --target wasm32-unknown-unknown --no-default-features --features aes256_wasm,crypto-host,bzip2,ppmd,util
         env:
           RUSTFLAGS: --cfg getrandom_backend="wasm_js"
       # The conformance harness builds the wasm32-wasip1 guest example itself
