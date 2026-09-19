@@ -126,10 +126,11 @@ the filter runs on the consuming thread anyway.
 - `Error::BlockDecode` names the block and the packed offset for a corrupt
   archive, distinctly from I/O and unsupported-method failures.
 
-Added, never altered — every upstream signature still means what it did. See
-[CHANGELOG.md](CHANGELOG.md), section `## Fork`, for the exhaustive list of
-divergences, and [AGENTS.md](AGENTS.md) for how the fork is rebased onto
-upstream.
+Added rather than altered so far — every sevenz-rust2 signature still means
+what it did, which keeps the migration a rename. See
+[CHANGELOG.md](CHANGELOG.md), section `## Fork`, for the record of
+divergences, and [AGENTS.md](AGENTS.md) for the rules of a crate that has
+left its origin behind.
 
 ### Encoders
 
