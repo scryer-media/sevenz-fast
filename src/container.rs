@@ -34,6 +34,7 @@ const MIB: u64 = 1024 * KIB;
 /// behalf would change what well-formed archives do.
 ///
 /// [`Error::LimitExceeded`]: crate::Error::LimitExceeded
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArchiveLimits {
     /// Largest decoder footprint the caller will allow, in bytes.
@@ -119,10 +120,15 @@ pub struct ArchiveLimits {
     /// Largest AES key-derivation work factor the caller will accept.
     ///
     /// Default: 24, which is 16.7 million SHA-256 rounds and what 7-Zip itself
-    /// refuses to exceed. The field in the archive is six bits, so 63 is
-    /// expressible and would be 9.2 × 10^18 rounds from a header a caller
-    /// merely opened.
+    /// refuses to exceed. Values above 24 cannot raise the decoder ceiling.
+    /// The special value 63 in an archive selects raw-key mode, without hashing.
     pub max_aes_cycles_power: u8,
+    /// Maximum actual SHA-256 KDF rounds across the reader's password lifetime,
+    /// including encoded headers and repeated block decodes. Cache hits and
+    /// raw-key mode cost zero; cache eviction does not reset the counter.
+    /// Default: 2^28. Checked before each derivation, so payload work can fail
+    /// during extraction. A fresh password or clone starts a fresh budget.
+    pub max_aes_kdf_rounds: u64,
     /// Whether an entry whose stored name would escape the extraction
     /// directory makes the archive unreadable.
     ///
@@ -153,6 +159,7 @@ impl Default for ArchiveLimits {
             max_unpack_bytes: u64::MAX,
             max_unpack_ratio: u64::MAX,
             max_aes_cycles_power: 24,
+            max_aes_kdf_rounds: 1 << 28,
             reject_unsafe_paths: false,
         }
     }
@@ -194,8 +201,9 @@ impl ArchiveLimits {
         self
     }
 
-    /// Every structural limit removed: counts, names, coders, nesting and the
-    /// key-derivation work factor are believed as the archive states them.
+    /// Removes caller-configurable limits on counts, names, coders and nesting.
+    /// The decoder's hard AES power ceiling of 24 still applies; raw-key mode
+    /// (63) is accepted because it performs no derivation.
     ///
     /// For reading archives this process wrote itself. Nothing else should use
     /// it, and nothing in this crate calls it.
@@ -215,6 +223,7 @@ impl ArchiveLimits {
             max_unpack_bytes: u64::MAX,
             max_unpack_ratio: u64::MAX,
             max_aes_cycles_power: 63,
+            max_aes_kdf_rounds: u64::MAX,
             reject_unsafe_paths: false,
         }
     }
@@ -393,6 +402,33 @@ const FILTER_BYTES: u64 = MIB;
 /// summed with it.
 const BCJ2_BYTES: u64 = 16 * MIB;
 
+pub(crate) fn check_aes_coders<'a>(
+    coders: impl Iterator<Item = &'a Coder>,
+    limits: &ArchiveLimits,
+) -> Result<(), crate::Error> {
+    for coder in coders {
+        if coder.encoder_method_id() != EncoderMethod::ID_AES256_SHA256 {
+            continue;
+        }
+        let power = coder
+            .properties
+            .first()
+            .ok_or_else(|| crate::Error::other("AES256 properties too short"))?
+            & 63;
+        let cap = limits
+            .max_aes_cycles_power
+            .min(crate::encryption::MAX_AES_CYCLES_POWER);
+        if power != 63 && power > cap {
+            return Err(crate::Error::limit(
+                crate::Limit::AesCyclesPower,
+                cap.into(),
+                power.into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl Archive {
     /// Bytes a single-threaded decode of this archive needs for its decoders.
     ///
@@ -551,6 +587,11 @@ fn ppmd_model_bytes(method_id: &[u8], properties: &[u8]) -> Result<u64, UnsizedC
 // ---------------------------------------------------------------------------
 
 impl Archive {
+    /// Validate per-coder powers before constructing decoders.
+    pub(crate) fn check_aes_work(&self, limits: &ArchiveLimits) -> Result<(), crate::Error> {
+        check_aes_coders(self.blocks.iter().flat_map(|block| &block.coders), limits)
+    }
+
     /// Total number of sub-streams across every block.
     ///
     /// A sub-stream is one entry's worth of a block's output. In a non-solid
@@ -648,5 +689,28 @@ impl Archive {
         self.blocks
             .get(block_index)
             .map_or(&[], |block| block.coders.as_slice())
+    }
+}
+
+#[cfg(test)]
+mod aes_budget_tests {
+    use super::*;
+
+    #[test]
+    fn raw_key_mode_is_allowed_but_the_hard_power_ceiling_remains() {
+        let mut coder = Coder::default();
+        coder.id_size = 4;
+        coder
+            .decompression_method_id_mut()
+            .copy_from_slice(EncoderMethod::ID_AES256_SHA256);
+        coder.properties = vec![63, 0];
+        check_aes_coders([&coder].into_iter(), &ArchiveLimits::unlimited()).unwrap();
+        coder.properties[0] = crate::encryption::MAX_AES_CYCLES_POWER + 1;
+        assert_eq!(
+            check_aes_coders([&coder].into_iter(), &ArchiveLimits::unlimited())
+                .unwrap_err()
+                .limit_hit(),
+            Some(crate::Limit::AesCyclesPower)
+        );
     }
 }

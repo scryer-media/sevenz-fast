@@ -26,6 +26,7 @@ dependencies = [
  "cipher",
  "cpubits",
  "cpufeatures 0.3.1",
+ "zeroize",
 ]
 
 [[package]]
@@ -213,6 +214,18 @@ dependencies = [
  "rustix-linux-procfs",
  "windows-sys 0.61.2",
  "winx",
+]
+
+[[package]]
+name = "cap-std"
+version = "4.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c1ec78e242cfa2cfe276807ac2ecc00315a6c97786977414bcd1c3963b6c91b8"
+dependencies = [
+ "cap-primitives",
+ "io-extras",
+ "io-lifetimes 3.0.1",
+ "rustix",
 ]
 
 [[package]]
@@ -1724,6 +1737,7 @@ dependencies = [
  "aws-lc-rs",
  "brotli",
  "bzip2",
+ "cap-std",
  "cbc",
  "flate2",
  "getrandom 0.4.3",
@@ -1738,6 +1752,7 @@ dependencies = [
  "wasm-bindgen",
  "wasmtime",
  "wasmtime-wasi",
+ "zeroize",
  "zstd 0.14.0",
 ]
 

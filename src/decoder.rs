@@ -310,6 +310,7 @@ pub fn add_decoder<I: Read>(
                 &coder.properties,
                 password,
                 opts.limits.max_aes_cycles_power,
+                opts.limits.max_aes_kdf_rounds,
             )?;
             Ok(Decoder::Aes256Sha256(Box::new(de)))
         }

@@ -966,14 +966,9 @@ fn an_aes_work_factor_over_the_limit_is_refused() {
         max_aes_cycles_power: 4,
         ..ArchiveLimits::default()
     };
-    let mut reader =
-        ArchiveReader::with_limits(Cursor::new(bytes), Password::from("x"), limits).unwrap();
-    let err = reader
-        .for_each_entries(&mut |_e: &ArchiveEntry, rd: &mut dyn std::io::Read| {
-            let _ = std::io::copy(rd, &mut std::io::sink());
-            Ok(true)
-        })
-        .expect_err("a work factor over the caller's limit must be refused");
+    let err = ArchiveReader::with_limits(Cursor::new(bytes), Password::from("x"), limits)
+        .err()
+        .expect("a work factor over the caller's limit must be refused while opening");
     assert_eq!(err.limit_hit(), Some(Limit::AesCyclesPower));
 }
 

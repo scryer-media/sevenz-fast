@@ -2,6 +2,7 @@ use std::{
     borrow::Cow,
     io::{Read, Seek},
 };
+use zeroize::{Zeroize, Zeroizing};
 
 #[cfg(feature = "compress")]
 use std::io::Write;
@@ -12,6 +13,7 @@ use aes::{
     cipher::{BlockModeEncrypt, KeyIvInit, array::Array},
 };
 
+use super::MAX_AES_CYCLES_POWER;
 use crate::Password;
 use crate::crypto_backend::{
     AES_BLOCK_LEN, Aes256Cbc, Aes256CbcLike, AesError, Sha256, Sha256Like,
@@ -49,16 +51,23 @@ pub(crate) struct Aes256Sha256Decoder<R> {
     pos: usize,
 }
 
+impl<R> Drop for Aes256Sha256Decoder<R> {
+    fn drop(&mut self) {
+        self.plain.zeroize();
+    }
+}
+
 impl<R: Read> Aes256Sha256Decoder<R> {
     pub(crate) fn new(
         input: R,
         properties: &[u8],
         password: &Password,
         max_cycles_power: u8,
+        max_kdf_rounds: u64,
     ) -> Result<Self, crate::Error> {
-        let (aes_key, iv) = get_aes_key(properties, password.as_slice(), max_cycles_power)?;
-        let cipher =
-            Aes256Cbc::new(&aes_key, &iv).map_err(|err| crate::Error::other(err.to_string()))?;
+        let (aes_key, iv) = get_aes_key(properties, password, max_cycles_power, max_kdf_rounds)?;
+        let cipher = Aes256Cbc::new(aes_key.as_ref(), &iv)
+            .map_err(|err| crate::Error::other(err.to_string()))?;
         Ok(Self {
             input,
             cipher,
@@ -193,9 +202,10 @@ impl<R: Read + Seek> Seek for Aes256Sha256Decoder<R> {
 
 fn get_aes_key(
     properties: &[u8],
-    password: &[u8],
+    password: &Password,
     max_cycles_power: u8,
-) -> Result<([u8; 32], [u8; 16]), crate::Error> {
+    max_kdf_rounds: u64,
+) -> Result<(Zeroizing<[u8; 32]>, [u8; 16]), crate::Error> {
     let properties = match properties.len() {
         0 => {
             return Err(crate::Error::other("AES256 properties too short"));
@@ -229,10 +239,10 @@ fn get_aes_key(
         // "Raw key" mode: the 32-byte key is `salt` followed by the password (both
         // truncated to fit). `salt_size` is at most 16, so copy only that prefix.
         // `aes_key.copy_from_slice(&salt)` would panic on the 32-vs-<=16 length mismatch.
-        let mut aes_key = [0u8; 32];
+        let mut aes_key = Zeroizing::new([0u8; 32]);
         aes_key[..salt_size].copy_from_slice(&salt[..salt_size]);
-        let n = password.len().min(aes_key.len() - salt_size);
-        aes_key[salt_size..n + salt_size].copy_from_slice(&password[0..n]);
+        let n = password.as_slice().len().min(aes_key.len() - salt_size);
+        aes_key[salt_size..n + salt_size].copy_from_slice(&password.as_slice()[0..n]);
         aes_key
     } else {
         // Cap the work factor: `derive_key` runs `2^num_cycles_power` SHA-256 rounds, so
@@ -248,18 +258,10 @@ fn get_aes_key(
                 u64::from(num_cycles_power),
             ));
         }
-        derive_key_cached(num_cycles_power, &salt, password)
+        derive_key_with_budget(num_cycles_power, &salt, password, max_kdf_rounds)?
     };
     Ok((aes_key, iv))
 }
-
-/// Hard ceiling on the AES-256 key-derivation work factor, whatever the caller's
-/// `ArchiveLimits::max_aes_cycles_power` says. `derive_key` runs
-/// `2^num_cycles_power` SHA-256 rounds; 7-Zip's own encoder never exceeds this, so a
-/// larger value only ever comes from a malicious archive trying to burn CPU. Keeping it
-/// below 32 also makes the `1 << num_cycles_power` shift safe, which is why a caller
-/// cannot raise it.
-pub(crate) const MAX_AES_CYCLES_POWER: u8 = 24;
 
 fn derive_key(num_cycles_power: u8, salt: &[u8], password: &[u8]) -> [u8; 32] {
     derive_key_with::<Sha256>(num_cycles_power, salt, password)
@@ -289,29 +291,58 @@ pub(crate) fn derive_key_with<S: Sha256Like>(
     sha.finalize()
 }
 
-/// Cache last derived key.
-fn derive_key_cached(num_cycles_power: u8, salt: &[u8], password: &[u8]) -> [u8; 32] {
-    static KEY_CACHE: std::sync::Mutex<Option<([u8; 32], [u8; 32])>> = std::sync::Mutex::new(None);
+/// A single cached key owned by one immutable Password, never by the process.
+pub(crate) struct CachedKey {
+    power: u8,
+    salt: Vec<u8>,
+    key: Zeroizing<[u8; 32]>,
+}
 
-    let fingerprint: [u8; 32] = {
-        let mut sha = Sha256::new();
-        sha.update(&[num_cycles_power, salt.len() as u8]);
-        sha.update(salt);
-        sha.update(password);
-        sha.finalize()
-    };
-    if let Some(key) = KEY_CACHE
-        .lock()
-        .unwrap()
-        .as_ref()
-        .and_then(|(cached_fp, key)| (*cached_fp == fingerprint).then_some(*key))
+#[derive(Default)]
+pub(crate) struct KeyCache {
+    pub(crate) key: Option<CachedKey>,
+    rounds: u64,
+}
+
+#[cfg(test)]
+fn derive_key_cached(power: u8, salt: &[u8], password: &Password) -> Zeroizing<[u8; 32]> {
+    derive_key_with_budget(power, salt, password, u64::MAX).unwrap()
+}
+
+fn derive_key_with_budget(
+    num_cycles_power: u8,
+    salt: &[u8],
+    password: &Password,
+    max_rounds: u64,
+) -> Result<Zeroizing<[u8; 32]>, crate::Error> {
+    let mut cache = password.key_cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(cached) = cache.key.as_ref()
+        && cached.power == num_cycles_power
+        && cached.salt == salt
     {
-        return key;
+        return Ok(cached.key.clone());
     }
-
-    let key = derive_key(num_cycles_power, salt, password);
-    *KEY_CACHE.lock().unwrap() = Some((fingerprint, key));
-    key
+    let rounds = cache
+        .rounds
+        .checked_add(1u64 << num_cycles_power)
+        .ok_or_else(|| crate::Error::other("AES KDF work total overflow"))?;
+    if rounds > max_rounds {
+        return Err(crate::Error::limit(
+            crate::Limit::AesKdfRounds,
+            max_rounds,
+            rounds,
+        ));
+    }
+    // Charge before hashing. The same password spans the header and payload,
+    // and retains the budget even when its one-entry cache is replaced.
+    cache.rounds = rounds;
+    let key = Zeroizing::new(derive_key(num_cycles_power, salt, password.as_slice()));
+    cache.key = Some(CachedKey {
+        power: num_cycles_power,
+        salt: salt.to_vec(),
+        key: key.clone(),
+    });
+    Ok(key)
 }
 
 #[cfg(feature = "compress")]
@@ -324,17 +355,26 @@ pub(crate) struct Aes256Sha256Encoder<W> {
 }
 
 #[cfg(feature = "compress")]
+impl<W> Drop for Aes256Sha256Encoder<W> {
+    fn drop(&mut self) {
+        self.buffer.zeroize();
+    }
+}
+
+#[cfg(feature = "compress")]
 impl<W> Aes256Sha256Encoder<W> {
     pub(crate) fn new(output: W, options: &AesEncoderOptions) -> Result<Self, crate::Error> {
         let (key, iv) = crate::encryption::aes::get_aes_key(
             &options.properties(),
-            options.password.as_slice(),
+            &options.password,
             MAX_AES_CYCLES_POWER,
+            u64::MAX,
         )?;
 
         Ok(Self {
             output,
-            enc: Aes256CbcEnc::new(&Array::from(key), &iv.into()),
+            enc: Aes256CbcEnc::new_from_slices(key.as_ref(), &iv)
+                .map_err(|e| crate::Error::other(e.to_string()))?,
             buffer: Default::default(),
             finished: false,
             write_size: 0,
@@ -416,26 +456,54 @@ mod key_derivation_tests {
     const CYCLES: u8 = 4;
 
     #[test]
+    fn budget_charges_misses_including_evictions_but_not_hits() {
+        let password = Password::new("test");
+        for _ in 0..513 {
+            derive_key_with_budget(2, b"same", &password, 4).unwrap();
+        }
+        assert_eq!(password.key_cache.lock().unwrap().rounds, 4);
+        assert_eq!(
+            derive_key_with_budget(2, b"other", &password, 4)
+                .unwrap_err()
+                .limit_hit(),
+            Some(crate::Limit::AesKdfRounds)
+        );
+        derive_key_with_budget(2, b"other", &password, 8).unwrap();
+        assert_eq!(
+            derive_key_with_budget(2, b"same", &password, 8)
+                .unwrap_err()
+                .limit_hit(),
+            Some(crate::Limit::AesKdfRounds)
+        );
+        password.key_cache.lock().unwrap().rounds = u64::MAX;
+        assert!(derive_key_with_budget(0, b"new", &password, u64::MAX).is_err());
+    }
+
+    #[test]
     fn cached_derivation_matches_reference() {
-        let (salt, password) = (b"salt".as_slice(), b"p\0a\0s\0s\0".as_slice());
-        let expected = derive_key(CYCLES, salt, password);
-        assert_eq!(derive_key_cached(CYCLES, salt, password), expected);
-        assert_eq!(derive_key_cached(CYCLES, salt, password), expected);
+        let password = Password::new("pass");
+        let expected = derive_key(CYCLES, b"salt", password.as_slice());
+        assert_eq!(*derive_key_cached(CYCLES, b"salt", &password), expected);
+        assert_eq!(*derive_key_cached(CYCLES, b"salt", &password), expected);
+        assert!(password.key_cache.lock().unwrap().key.is_some());
+        assert!(password.clone().key_cache.lock().unwrap().key.is_none());
     }
 
     #[test]
     fn cache_never_crosses_inputs() {
-        let a = (b"salt-a".as_slice(), b"pw-a".as_slice());
-        let b = (b"salt-a".as_slice(), b"pw-b".as_slice());
-        let c = (b"salt-c".as_slice(), b"pw-a".as_slice());
-        let ka = derive_key(CYCLES, a.0, a.1);
-        let kb = derive_key(CYCLES, b.0, b.1);
-        let kc = derive_key(CYCLES, c.0, c.1);
-        assert_eq!(derive_key_cached(CYCLES, a.0, a.1), ka);
-        assert_eq!(derive_key_cached(CYCLES, b.0, b.1), kb);
-        assert_eq!(derive_key_cached(CYCLES, a.0, a.1), ka);
-        assert_eq!(derive_key_cached(CYCLES, c.0, c.1), kc);
-        assert_eq!(derive_key_cached(CYCLES, b.0, b.1), kb);
+        let a = Password::new("pw-a");
+        let b = Password::new("pw-b");
+        for (salt, password) in [
+            (b"salt-a", &a),
+            (b"salt-a", &b),
+            (b"salt-c", &a),
+            (b"salt-a", &a),
+        ] {
+            assert_eq!(
+                *derive_key_cached(CYCLES, salt, password),
+                derive_key(CYCLES, salt, password.as_slice())
+            );
+        }
     }
 
     /// Builds an AES coder property blob: `num_cycles_power` in the low six
@@ -463,15 +531,16 @@ mod key_derivation_tests {
         let password = b"p\0a\0s\0s\0";
         let (key, iv) = get_aes_key(
             &properties(0x3F, salt, &[0u8; 16]),
-            password,
+            &Password::from_raw(password),
             MAX_AES_CYCLES_POWER,
+            u64::MAX,
         )
         .expect("key");
 
         let mut expected = [0u8; 32];
         expected[..16].copy_from_slice(salt);
         expected[16..16 + password.len()].copy_from_slice(password);
-        assert_eq!(key, expected);
+        assert_eq!(*key, expected);
         assert_eq!(iv, [0u8; 16]);
     }
 
@@ -485,8 +554,9 @@ mod key_derivation_tests {
             assert!(
                 get_aes_key(
                     &properties(power, salt, &[0u8; 16]),
-                    b"pw",
-                    MAX_AES_CYCLES_POWER
+                    &Password::from_raw(b"pw"),
+                    MAX_AES_CYCLES_POWER,
+                    u64::MAX
                 )
                 .is_err(),
                 "cycle count {power} was accepted"
@@ -497,8 +567,9 @@ mod key_derivation_tests {
         assert!(
             get_aes_key(
                 &properties(4, salt, &[0u8; 16]),
-                b"pw",
-                MAX_AES_CYCLES_POWER
+                &Password::from_raw(b"pw"),
+                MAX_AES_CYCLES_POWER,
+                u64::MAX
             )
             .is_ok()
         );
@@ -506,11 +577,11 @@ mod key_derivation_tests {
 
     #[test]
     fn cycle_count_is_part_of_the_identity() {
-        let (salt, password) = (b"salt".as_slice(), b"pw".as_slice());
-        let k4 = derive_key_cached(4, salt, password);
-        let k5 = derive_key_cached(5, salt, password);
+        let (salt, password) = (b"salt".as_slice(), Password::from_raw(b"pw"));
+        let k4 = derive_key_cached(4, salt, &password);
+        let k5 = derive_key_cached(5, salt, &password);
         assert_ne!(k4, k5);
-        assert_eq!(derive_key_cached(4, salt, password), k4);
+        assert_eq!(derive_key_cached(4, salt, &password), k4);
     }
 }
 
@@ -559,7 +630,8 @@ mod tests {
 
     fn assert_decodes<R: Read>(input: R, properties: &[u8], password: &Password, original: &[u8]) {
         let mut dec =
-            Aes256Sha256Decoder::new(input, properties, password, MAX_AES_CYCLES_POWER).unwrap();
+            Aes256Sha256Decoder::new(input, properties, password, MAX_AES_CYCLES_POWER, u64::MAX)
+                .unwrap();
 
         let mut decoded = vec![];
         let _ = std::io::copy(&mut dec, &mut decoded).unwrap();
@@ -595,6 +667,7 @@ mod tests {
                 &properties,
                 &password,
                 MAX_AES_CYCLES_POWER,
+                u64::MAX,
             )
             .unwrap();
 
@@ -628,6 +701,7 @@ mod tests {
             &properties,
             &password,
             MAX_AES_CYCLES_POWER,
+            u64::MAX,
         )
         .unwrap();
         let mut sink = Vec::new();
