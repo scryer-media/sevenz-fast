@@ -56,11 +56,11 @@ against. Upstream's own changelog continues below, unchanged.
   optional dependency behind the `compress` feature, which still uses its LZMA
   and LZMA2 *encoders*; with `--no-default-features` the graph is
   `sevenz-turbo → lzma-turbo → crc-fast` and nothing else.
-- The BCJ, BCJ2 and delta filters are vendored into `src/codec/filter/` from
-  `lzma-rust2` 0.20.1 (Apache-2.0, same licence), which is what lets
-  `lzma-rust2` leave the decode graph rather than be carried for three filters.
-  `src/codec/filter/mod.rs` documents the provenance and the mechanical
-  changes.
+- The BCJ and delta filters are `lzma-turbo`'s, and BCJ2 is vendored into
+  `src/codec/filter/` from `lzma-rust2` 0.20.1 (Apache-2.0, same licence),
+  which together are what let `lzma-rust2` leave the decode graph rather than
+  be carried for three filters. `src/codec/filter/mod.rs` documents what is
+  still vendored and the mechanical changes made to it.
 - LZMA2 decodes on several threads through `lzma-turbo`'s `Lzma2AdaptiveDecoder`
   — a stream is cut at the dictionary resets that make a *run* independently
   decodable, and runs are decoded on workers while output stays in order.
@@ -374,6 +374,31 @@ Everything here is new surface; no upstream signature changed meaning.
 - The vendored BCJ round-trip tests generate their sample data instead of
   reading the binary fixtures `lzma-rust2` keeps in its repository, which are
   not ours to vendor.
+
+## 0.24.0 - 2026-09-18
+
+- The BCJ and delta filters are `lzma-turbo`'s. They were vendored from
+  `lzma-rust2` 0.20.1, which meant this crate carried a second port of the
+  same eight branch converters and the same delta filter from the same
+  public-domain C that `lzma-turbo` - already the dependency the LZMA comes
+  from - ports as well. `src/codec/filter/bcj/` is gone, and `BcjFilter` and
+  `Delta` are handles on `lzma_turbo::filters::{bcj, delta}`. The readers and
+  writers around them are untouched, so the crate's own API does not move.
+  BCJ2 stays vendored: `lzma-turbo` has no BCJ2, because .xz has none.
+- The delta filter is a straight walk rather than a 256-byte ring. Upstream's
+  carried its history in a ring with a moving index and paid two masked index
+  computations, a load, an add and a store for every byte in both directions;
+  `lzma-turbo`'s keeps the C's own shape, a history prefix that is shifted, and
+  at distances of sixteen and up adds a block of `distance` bytes at a time,
+  which is legal because any `distance` consecutive outputs depend on bytes
+  that are already final.
+- On a Zen 2 machine, medians of nine interleaved rounds, one thread,
+  extracting 39.7 MiB through delta and 64.0 MiB through BCJ: delta at
+  distance 64, 0.456s to 0.414s (+9.2%); at distance 4, 0.313s to 0.290s
+  (+7.4%); the x86 branch filter, 0.386s to 0.363s (+6.0%); ARM64, +0.3%. The
+  same archives with no filter in the chain move 0.00%, which is the control.
+- Requires `lzma-turbo` 0.4.0 and turns on its `filters` feature: the
+  converters alone, without the `.xz` stream layer, its readers or `crc-fast`.
 
 ## 0.23.4 - 2026-09-18
 

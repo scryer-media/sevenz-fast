@@ -1,48 +1,44 @@
-//! Delta filter.
+//! The delta filter, over `lzma-turbo`'s.
+//!
+//! The readers and writers below are still `lzma-rust2`'s, vendored (see the
+//! module doc a level up). What sat under them was a 256-byte ring with a
+//! moving index, walked one byte at a time in both directions: per byte, two
+//! masked index computations, a load, an add and a store. The filter it
+//! implements is `out[i] = in[i] + out[i - distance]`, and the ring exists
+//! only to carry the last `distance` bytes from one call to the next.
+//!
+//! `lzma-turbo` carries the C's own shape instead - the history as a plain
+//! prefix that is shifted rather than rotated, so the body is a straight walk
+//! over the buffer, and at distances of sixteen and up a block of `distance`
+//! bytes at a time, which is legal because any `distance` consecutive outputs
+//! depend on bytes that are already final. It is checked byte for byte against
+//! the SDK's own delta filter.
 
 use std::io::Read;
 #[cfg(feature = "compress")]
 use std::io::Write;
 
-const MAX_DISTANCE: usize = 256;
-const _MIN_DISTANCE: usize = 1;
-const DIS_MASK: usize = MAX_DISTANCE - 1;
+use lzma_turbo::filters::delta::Delta as TurboDelta;
 
-pub(crate) struct Delta {
-    distance: usize,
-    history: [u8; MAX_DISTANCE],
-    pos: u8,
-}
+pub(crate) struct Delta(TurboDelta);
 
 impl Delta {
     pub(crate) fn new(distance: usize) -> Self {
-        Self {
-            distance,
-            history: [0; MAX_DISTANCE],
-            pos: 0,
-        }
+        // Spec: the property byte is the distance minus one, so distances run
+        // from 1 to 256. The 7z method properties are one byte, so a distance
+        // outside that range cannot have come off a disk; clamping rather than
+        // failing keeps the vendored signature, which cannot fail.
+        let props = u8::try_from(distance.clamp(1, 256) - 1).expect("clamped to 0..=255");
+        Self(TurboDelta::new(props).expect("every one-byte property is a valid distance"))
     }
 
     pub(crate) fn decode(&mut self, buf: &mut [u8]) {
-        for item in buf {
-            let pos = self.pos as usize;
-            let h = self.history[(self.distance.wrapping_add(pos)) & DIS_MASK];
-            *item = item.wrapping_add(h);
-            self.history[pos & DIS_MASK] = *item;
-            self.pos = self.pos.wrapping_sub(1);
-        }
+        self.0.decode(buf);
     }
 
     #[cfg(feature = "compress")]
     fn encode(&mut self, buf: &mut [u8]) {
-        for item in buf {
-            let pos = self.pos as usize;
-            let h = self.history[(self.distance.wrapping_add(pos)) & DIS_MASK];
-            let original = *item;
-            *item = item.wrapping_sub(h);
-            self.history[pos & DIS_MASK] = original;
-            self.pos = self.pos.wrapping_sub(1);
-        }
+        self.0.encode(buf);
     }
 }
 
