@@ -22,6 +22,11 @@ use lzma_turbo::{
 
 use crate::error::Error;
 
+/// The `Write` fronts over `lzma-turbo`'s encoders, which the coder chain
+/// in `crate::encoder` builds unless the build chose `lzma-rust2`'s.
+#[cfg(all(feature = "compress", not(feature = "lzma-rust2-encoder")))]
+pub(crate) mod writer;
+
 /// Bytes an LZMA or LZMA2 decoder holds beyond its dictionary: the range
 /// decoder's input buffer, the probability tables and the chunk buffer. The
 /// reference decoder's own accounting is tens of kilobytes; a megabyte covers

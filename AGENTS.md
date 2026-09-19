@@ -4,65 +4,59 @@ These rules apply to every automated agent and every human contributor.
 
 ## What this repository is
 
-`sevenz-turbo` is a fork of [sevenz-rust2](https://github.com/hasenbanck/sevenz-rust2)
-by hasenbanck, Apache-2.0, forked at upstream `12ed7c8` (post-v0.22.2). It
-exists for two reasons and no others:
+`sevenz-turbo` began as a fork of
+[sevenz-rust2](https://github.com/hasenbanck/sevenz-rust2) by hasenbanck,
+Apache-2.0, taken at its commit `12ed7c8` (post-v0.22.2). It is a hard fork:
+it is not rebased onto sevenz-rust2, nothing is sent back there, and the two
+have diverged for good. The origin is recorded for licensing and for readers
+arriving from the other crate, not as a constraint. The fork was made for two
+reasons:
 
 1. **Codec swap.** LZMA (`03 01 01`) and LZMA2 (`21`) decode through
    [`lzma-turbo`](https://github.com/scryer-media/lzma-turbo), a port of Igor
-   Pavlov's reference decoder, instead of `lzma-rust2`. `lzma-rust2` is not in
-   the library's runtime dependency graph; it remains only behind the
-   `compress` feature, whose encoders upstream needs for writing archives.
+   Pavlov's reference decoder, instead of `lzma-rust2`, and are encoded by
+   its port of the SDK encoder when archives are written. `lzma-rust2` is not
+   in the dependency graph unless the non-default `lzma-rust2-encoder`
+   feature asks for its encoders instead.
 2. **Container API.** The 7z detail a streaming consumer needs and upstream
    does not expose: memory limits enforced before allocation, per-member CRCs,
    folder-to-pack-stream byte ranges, a reader that parses once and decodes
    from a caller-supplied `Read + Seek`, typed corruption errors carrying a
    block index and packed offset, and a per-block completion hook.
 
-Everything else should stay byte-for-byte upstream so that rebases are
-mechanical. **Rust module paths and the public API are upstream's**, so a
-consumer's migration is `sevenz_rust2::` → `sevenz_turbo::` plus the new calls.
+The Rust module paths and the public API started as sevenz-rust2's, so a
+consumer's migration is `sevenz_rust2::` → `sevenz_turbo::` plus the new
+calls. That compatibility is a courtesy this crate keeps while it costs
+nothing, not a rule: an API that the container work needs to change, changes,
+with a version bump and a changelog entry like any other.
 
-## Fork rules
+## Divergence rules
 
-1. **Confine the diff.** New behaviour goes in new files under `src/codec/`,
-   `src/limits.rs`, `src/crypto_backend.rs` and friends. Touch `src/decoder.rs`
-   and `src/reader.rs` only where the swap and the new API genuinely need it.
-   Never reformat, rename or "tidy" upstream code: every such hunk is a rebase
-   conflict forever.
-2. **Never change an upstream public signature.** Add; do not alter. If an
-   addition would be a breaking change upstream-side, add a parallel entry
-   point (`with_limits` beside `new`) instead.
-3. **Record every divergence** in the `## Fork` section of `CHANGELOG.md`, in
-   the same commit that creates it. That section is the rebase checklist.
-4. **Upstream fixes go upstream.** A bug that is not ours is reported and, if
-   possible, fixed at hasenbanck/sevenz-rust2; we take it on the next rebase.
-
-## How to rebase onto upstream
-
-```sh
-git fetch upstream
-git log --oneline 12ed7c8..upstream/main          # what moved
-git diff 12ed7c8..HEAD -- src/ > /tmp/fork.diff   # what we carry
-git switch -c chore/rebase-<upstream-tag> main
-git rebase --onto upstream/main 12ed7c8
-```
-
-Conflicts should appear only in `src/decoder.rs` and `src/reader.rs`. Work
-through the `## Fork` changelog section afterwards and confirm every listed
-divergence still exists; a silently dropped one is the failure mode. Then move
-the fork base commit named at the top of this file, and re-run the extraction
-differential matrix in `docs/benchmarking.md`.
+1. **Every change is ours to make.** There is no upstream to confine a diff
+   for, no signature that is off limits, and no rebase that a reformat could
+   break. Change what the work needs, where it lives.
+2. **Bugs are fixed here.** A bug inherited from sevenz-rust2 is a bug in this
+   crate; it is fixed and released here, whether or not the other crate has
+   it too.
+3. **Keep the `## Fork` section of `CHANGELOG.md` honest.** It is the record
+   of how this crate differs from the commit it was taken at, kept for readers
+   who know the other crate. A change that adds to that difference is noted
+   there in the same commit; it is a record, not a checklist to reconcile.
 
 ## Codec rules
 
-- LZMA and LZMA2 decoding is `lzma-turbo`'s, reached only through
-  `src/codec/lzma_turbo.rs`. Nothing else in the crate names `lzma_turbo::`.
-  That file is also where the multi-threaded LZMA2 coder lives; see
-  `docs/lzma-turbo-requests.md`.
-- The BCJ, BCJ2 and delta filters are vendored from `lzma-rust2` (Apache-2.0,
-  see `src/codec/filter/mod.rs`) so the crate does not carry `lzma-rust2` at
-  runtime. Fixes to them belong upstream in `lzma-rust2` as well as here.
+- LZMA and LZMA2 coding is `lzma-turbo`'s, reached only through
+  `src/codec/lzma_turbo.rs` (decoding, and the multi-threaded LZMA2 coder;
+  see `docs/lzma-turbo-requests.md`) and `src/codec/lzma_turbo/writer.rs`
+  (encoding: the `Write` bridge over its pull-driven encoders). Nothing else
+  in the crate names `lzma_turbo::` except the filter wrappers below. The
+  `lzma-rust2-encoder` feature swaps the encoders for `lzma-rust2`'s; the
+  option types in `src/encoder_options.rs` are encoder-agnostic so that the
+  swap is confined to `src/encoder.rs`.
+- The BCJ and delta filters are `lzma-turbo`'s (`lzma_turbo::filters`, behind
+  its `filters` feature); `src/codec/filter/bcj.rs` and `delta.rs` are handles
+  on them. BCJ2 is a 7z filter with no .xz equivalent and stays vendored from
+  `lzma-rust2` (Apache-2.0, see `src/codec/filter/mod.rs`).
 - Crypto goes through `src/crypto_backend.rs` — SHA-256 *and* AES-256-CBC:
   `aws-lc-rs` by default, RustCrypto when the `native-crypto` feature is on.
   Never call a backend crate directly from anywhere else. The one exception is

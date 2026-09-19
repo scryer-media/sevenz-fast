@@ -6,9 +6,12 @@ Only the latest published release of `sevenz-turbo` receives fixes.
 
 ## Reporting a vulnerability
 
-Please do not open a public issue for security problems. Use GitHub's private
-vulnerability reporting on this repository (Security tab, "Report a
-vulnerability"). You will get an acknowledgement within a few days.
+Please do not open a public issue for security problems. Report privately
+through GitHub at <https://github.com/scryer-media/sevenz-turbo/security/advisories/new>
+(the Security tab, "Report a vulnerability"); private reporting is enabled on
+this repository. You will get an acknowledgement within a few days, and a
+fix ships as a new release of the crate, credited to you unless you ask
+otherwise.
 
 ## The threat model, and what bounds it
 
@@ -22,7 +25,7 @@ is attacker-controlled. Reports of panics, out-of-bounds reads, unbounded
 allocation, path traversal on extraction, or hangs on crafted archives are
 security reports and are handled as such. Include the archive if you can.
 
-If the problem is inherited from upstream
-[sevenz-rust2](https://github.com/hasenbanck/sevenz-rust2) rather than created
-by this fork, tell us, and we will coordinate with upstream rather than
-disclose ahead of them.
+This crate is a hard fork of
+[sevenz-rust2](https://github.com/hasenbanck/sevenz-rust2) and is not kept in
+step with it. A bug that exists there too is still fixed and released here;
+we do not hold a fix for it, and we do not disclose on its behalf.

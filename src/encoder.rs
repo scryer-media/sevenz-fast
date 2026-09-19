@@ -1,6 +1,10 @@
 use std::io::Write;
 
+#[cfg(feature = "lzma-rust2-encoder")]
 use lzma_rust2::{Lzma2Writer, Lzma2WriterMt, LzmaWriter};
+
+#[cfg(not(feature = "lzma-rust2-encoder"))]
+use crate::codec::lzma_turbo::writer::{Coder, LzmaTurboWriter};
 
 use crate::codec::filter::{bcj::BcjWriter, delta::DeltaWriter};
 
@@ -25,16 +29,29 @@ use crate::encryption::Aes256Sha256Encoder;
 use crate::{
     Error,
     archive::{EncoderConfiguration, EncoderMethod},
-    encoder_options::{DeltaOptions, EncoderOptions, Lzma2Options, LzmaOptions},
+    encoder_options::{DeltaOptions, EncoderOptions, Lzma2Options, LzmaOptions, LzmaSettings},
     writer::CountingWriter,
 };
 
+// One of these is built per coder in a chain and boxed there as a
+// `dyn Write`; its variants range from a counting writer to a brotli state
+// of several KiB, and the difference costs nothing.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum Encoder<W: Write> {
     Copy(CountingWriter<W>),
     Bcj(Option<BcjWriter<CountingWriter<W>>>),
     Delta(DeltaWriter<CountingWriter<W>>),
+    // LZMA and LZMA2 are `lzma-turbo`'s encoders unless the build asked for
+    // `lzma-rust2`'s; see `Cargo.toml`. Both fronts have the same shape here.
+    #[cfg(not(feature = "lzma-rust2-encoder"))]
+    Lzma(Option<LzmaTurboWriter<CountingWriter<W>>>),
+    #[cfg(not(feature = "lzma-rust2-encoder"))]
+    Lzma2(Option<LzmaTurboWriter<CountingWriter<W>>>),
+    #[cfg(feature = "lzma-rust2-encoder")]
     Lzma(Option<LzmaWriter<CountingWriter<W>>>),
+    #[cfg(feature = "lzma-rust2-encoder")]
     Lzma2(Option<Lzma2Writer<CountingWriter<W>>>),
+    #[cfg(feature = "lzma-rust2-encoder")]
     Lzma2Mt(Option<Lzma2WriterMt<CountingWriter<W>>>),
     #[cfg(feature = "ppmd")]
     Ppmd(Option<Box<ppmd_rust::Ppmd7Encoder<CountingWriter<W>>>>),
@@ -90,6 +107,7 @@ impl<W: Write> Write for Encoder<W> {
                 }
                 false => w.as_mut().unwrap().write(buf),
             },
+            #[cfg(feature = "lzma-rust2-encoder")]
             Encoder::Lzma2Mt(w) => match buf.is_empty() {
                 true => {
                     let writer = w.take().unwrap();
@@ -164,6 +182,7 @@ impl<W: Write> Write for Encoder<W> {
             Encoder::Delta(w) => w.flush(),
             Encoder::Lzma(w) => w.as_mut().unwrap().flush(),
             Encoder::Lzma2(w) => w.as_mut().unwrap().flush(),
+            #[cfg(feature = "lzma-rust2-encoder")]
             Encoder::Lzma2Mt(w) => w.as_mut().unwrap().flush(),
             #[cfg(feature = "brotli")]
             Encoder::Brotli(w) => w.flush(),
@@ -188,7 +207,7 @@ fn validate_lzma_dictionary_size(dict_size: u32) -> Result<(), Error> {
     // and its Vec<i32> allocation within the platform's isize::MAX bytes.
     // This also leaves room for the encoder's lookahead and reserve buffers.
     let max_dict_size = ((1u64 << 30) - 1).min(isize::MAX as u64 / 8 - 1);
-    if !(u64::from(lzma_rust2::DICT_SIZE_MIN)..=max_dict_size).contains(&u64::from(dict_size)) {
+    if !(u64::from(LzmaSettings::DICT_SIZE_MIN)..=max_dict_size).contains(&u64::from(dict_size)) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("unsupported LZMA dictionary size: {dict_size} (maximum {max_dict_size})"),
@@ -196,6 +215,21 @@ fn validate_lzma_dictionary_size(dict_size: u32) -> Result<(), Error> {
         .into());
     }
     Ok(())
+}
+
+/// The LZMA2 property byte for `dict_size`: the smallest of the table's 41
+/// dictionaries that is at least as large.
+///
+/// The encoder's window is exactly `dict_size`, so the byte must never name a
+/// smaller dictionary, or a decoder allocates less than a match can reach
+/// back over. A size that is not a power of two or three times one is rounded
+/// up, as `Lzma2Enc_WriteProperties` does.
+fn lzma2_property_for(dict_size: u32) -> u8 {
+    (0..=40u8)
+        .find(|&prop| {
+            crate::codec::lzma_turbo::lzma2_dictionary_size(&[prop]).is_ok_and(|d| d >= dict_size)
+        })
+        .unwrap_or(40)
 }
 
 pub(crate) fn add_encoder<W: Write>(
@@ -229,8 +263,11 @@ pub(crate) fn add_encoder<W: Write>(
                 Some(EncoderOptions::Lzma(options)) => options.clone(),
                 _ => LzmaOptions::default(),
             };
-            validate_lzma_dictionary_size(options.0.dict_size)?;
-            let lz = LzmaWriter::new_no_header(input, &options.0, false)?;
+            validate_lzma_dictionary_size(options.0.dict_size())?;
+            #[cfg(not(feature = "lzma-rust2-encoder"))]
+            let lz = LzmaTurboWriter::new(input, &options.0.turbo_props(), Coder::Lzma)?;
+            #[cfg(feature = "lzma-rust2-encoder")]
+            let lz = LzmaWriter::new_no_header(input, &options.0.rust2_options(), false)?;
             Ok(Encoder::Lzma(Some(lz)))
         }
         EncoderMethod::ID_LZMA2 => {
@@ -239,16 +276,38 @@ pub(crate) fn add_encoder<W: Write>(
                 _ => Lzma2Options::default(),
             };
 
-            validate_lzma_dictionary_size(lzma2_options.options.lzma_options.dict_size)?;
-            let encoder = match lzma2_options.threads {
-                0 | 1 => Encoder::Lzma2(Some(Lzma2Writer::new(input, lzma2_options.options))),
-                _ => {
-                    let threads = lzma2_options.threads;
-                    Encoder::Lzma2Mt(Some(Lzma2WriterMt::new(
-                        input,
-                        lzma2_options.options,
+            validate_lzma_dictionary_size(lzma2_options.settings.dict_size())?;
+            #[cfg(not(feature = "lzma-rust2-encoder"))]
+            let encoder = {
+                // One thread is the solid stream; block threads need a block
+                // size, and a chunk size without threads changes nothing.
+                let (block_size, threads) =
+                    match (lzma2_options.threads, lzma2_options.block_size()) {
+                        (0 | 1, _) | (_, None) => (lzma_turbo::BLOCK_SIZE_SOLID, 1),
+                        (threads, Some(block_size)) => (block_size, threads as usize),
+                    };
+                Encoder::Lzma2(Some(LzmaTurboWriter::new(
+                    input,
+                    &lzma2_options.settings.turbo_props(),
+                    Coder::Lzma2 {
+                        block_size,
                         threads,
-                    )?))
+                    },
+                )?))
+            };
+            #[cfg(feature = "lzma-rust2-encoder")]
+            let encoder = {
+                let mut options =
+                    lzma_rust2::Lzma2Options::with_preset(lzma2_options.settings.level());
+                options.lzma_options = lzma2_options.settings.rust2_options();
+                options.set_chunk_size(
+                    lzma2_options
+                        .block_size()
+                        .and_then(std::num::NonZeroU64::new),
+                );
+                match lzma2_options.threads {
+                    0 | 1 => Encoder::Lzma2(Some(Lzma2Writer::new(input, options))),
+                    threads => Encoder::Lzma2Mt(Some(Lzma2WriterMt::new(input, options, threads)?)),
                 }
             };
 
@@ -362,11 +421,7 @@ pub(crate) fn get_options_as_properties<'a>(
                 Some(EncoderOptions::Lzma2(options)) => options,
                 _ => &Lzma2Options::default(),
             };
-            let dict_size = options.options.lzma_options.dict_size;
-            let lead = dict_size.leading_zeros();
-            let second_bit = (dict_size >> (30u32.wrapping_sub(lead))).wrapping_sub(2);
-            let prop = (19u32.wrapping_sub(lead) * 2 + second_bit) as u8;
-            out[0] = prop;
+            out[0] = lzma2_property_for(options.settings.dict_size());
             &out[0..1]
         }
         EncoderMethod::ID_LZMA => {
@@ -374,8 +429,8 @@ pub(crate) fn get_options_as_properties<'a>(
                 Some(EncoderOptions::Lzma(options)) => options,
                 _ => &LzmaOptions::default(),
             };
-            let dict_size = options.0.dict_size;
-            out[0] = options.0.get_props();
+            let dict_size = options.0.dict_size();
+            out[0] = LzmaSettings::props_byte();
             out[1..5].copy_from_slice(dict_size.to_le_bytes().as_ref());
             &out[0..5]
         }
@@ -437,5 +492,37 @@ pub(crate) fn get_options_as_properties<'a>(
             &out[..34]
         }
         _ => &[],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lzma2_property_for;
+    use crate::codec::lzma_turbo::lzma2_dictionary_size;
+
+    #[test]
+    fn the_lzma2_property_never_names_a_smaller_dictionary() {
+        for dict in [
+            4096u32,
+            1 << 18,
+            (1 << 20) + 1,
+            3 << 20,
+            5 << 20,
+            (3 << 20) + 1,
+            1 << 26,
+            (1 << 30) - 1,
+            u32::MAX,
+        ] {
+            let prop = lzma2_property_for(dict);
+            let named = lzma2_dictionary_size(&[prop]).unwrap();
+            assert!(named >= dict, "{dict}: property {prop} names {named}");
+            if prop > 0 {
+                let below = lzma2_dictionary_size(&[prop - 1]).unwrap();
+                assert!(below < dict, "{dict}: property {} would do", prop - 1);
+            }
+        }
+        assert_eq!(lzma2_property_for(1 << 20), 16);
+        assert_eq!(lzma2_property_for(3 << 20), 19);
+        assert_eq!(lzma2_property_for(5 << 20), 21);
     }
 }

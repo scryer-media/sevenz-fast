@@ -9,7 +9,7 @@ readme = "README.md"
 repository = "https://github.com/scryer-media/sevenz-turbo"
 # Raised from upstream's 1.93: `lzma-turbo` requires 1.97.1.
 rust-version = "1.97.1"
-version = "0.24.0"
+version = "0.25.0"
 # Repository scaffolding that has no business in the crate archive.
 exclude = [".github/", ".githooks/", ".gitleaks.toml", ".gitattributes", "renovate.json", "AGENTS.md", ".cargo/", "xtask/", "rust-toolchain.toml"]
 
@@ -60,7 +60,14 @@ native-crypto = ["dep:aes", "dep:cbc", "lzma-turbo/native-crypto"]
 crypto-host = ["lzma-turbo/native-crypto"]
 brotli = ["dep:brotli"]
 bzip2 = ["dep:bzip2"]
-compress = ["dep:lzma-rust2", "dep:aes", "dep:cbc"]
+# Writing archives. LZMA and LZMA2 are encoded by `lzma-turbo`'s port of the
+# SDK encoder (see `src/codec/lzma_turbo/writer.rs`); the AES-256 encryptor
+# stays on RustCrypto.
+compress = ["lzma-turbo/enc", "dep:aes", "dep:cbc"]
+# The alternative: encode LZMA and LZMA2 with `lzma-rust2`'s pure-Rust
+# encoders instead. Off by default; with it on, `lzma-turbo`'s encoder is not
+# used. Same option types, same archives, different bytes.
+lzma-rust2-encoder = ["compress", "dep:lzma-rust2"]
 deflate = ["dep:flate2"]
 lz4 = ["dep:lz4_flex"]
 ppmd = ["dep:ppmd-rust"]
@@ -84,8 +91,8 @@ getrandom = { version = "0.4", optional = true }
 # (`cargo xtask release` refuses to tag while it is here). Consumers get both
 # crates from crates.io.
 lzma-turbo = { version = "0.4.0", default-features = false, features = ["std", "asm", "crc", "filters"] }
-# Encoders only, behind `compress`. The decode path never reaches lzma-rust2;
-# see AGENTS.md.
+# Encoders only, behind `lzma-rust2-encoder`, as the alternative to
+# `lzma-turbo`'s. The decode path never reaches lzma-rust2; see AGENTS.md.
 lzma-rust2 = { version = "0.20", default-features = false, features = ["std", "encoder", "optimization"], optional = true }
 ppmd-rust = { version = "1", optional = true }
 lz4_flex = { version = "0.14", optional = true }

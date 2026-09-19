@@ -8,14 +8,144 @@ use crate::EncoderConfiguration;
 #[cfg(feature = "aes256")]
 use crate::Password;
 
+/// The LZMA settings both option types carry, independent of which encoder
+/// runs them. `None` is "the level's default".
+///
+/// The levels are the table `lzma-rust2` uses, which is xz's: the dictionary
+/// doubles from 256 KiB at level 0 to 64 MiB at level 9, levels 0 to 3 are
+/// the fast parser over a hash chain and the rest the optimal parser over a
+/// binary tree. Both encoders are given these numbers outright, so a level
+/// means the same dictionary, and the same archive memory, whichever one the
+/// build compiles - the SDK's own level defaults, which reach 256 MiB, are
+/// not used.
+#[cfg(feature = "compress")]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LzmaSettings {
+    level: u32,
+    dict_size: Option<u32>,
+    nice_len: Option<u32>,
+}
+
+#[cfg(feature = "compress")]
+impl LzmaSettings {
+    /// The smallest dictionary either encoder accepts.
+    pub(crate) const DICT_SIZE_MIN: u32 = 4096;
+    /// The largest dictionary the option setters allow; the encoder's own
+    /// limit, checked when the coder is built, is lower.
+    const DICT_SIZE_MAX: u32 = 4_294_967_280;
+    const NICE_LEN_MIN: u32 = 8;
+    const NICE_LEN_MAX: u32 = 273;
+
+    /// Dictionary size by level.
+    const LEVEL_DICT_SIZE: [u32; 10] = [
+        1 << 18,
+        1 << 20,
+        1 << 21,
+        1 << 22,
+        1 << 22,
+        1 << 23,
+        1 << 23,
+        1 << 24,
+        1 << 25,
+        1 << 26,
+    ];
+    /// Nice match length by level.
+    const LEVEL_NICE_LEN: [u32; 10] = [128, 128, 273, 273, 16, 32, 64, 64, 64, 64];
+    /// Hash-chain depth for the fast levels; the optimal levels leave it to
+    /// the encoder.
+    #[cfg(not(feature = "lzma-rust2-encoder"))]
+    const LEVEL_DEPTH: [u32; 4] = [4, 8, 24, 48];
+
+    const fn from_level(level: u32) -> Self {
+        LzmaSettings {
+            level: if level > 9 { 9 } else { level },
+            dict_size: None,
+            nice_len: None,
+        }
+    }
+
+    #[cfg(feature = "lzma-rust2-encoder")]
+    pub(crate) const fn level(&self) -> u32 {
+        self.level
+    }
+
+    #[cfg(not(feature = "lzma-rust2-encoder"))]
+    const fn fast(&self) -> bool {
+        self.level <= 3
+    }
+
+    fn set_dict_size(&mut self, dict_size: u32) {
+        self.dict_size = Some(dict_size.clamp(Self::DICT_SIZE_MIN, Self::DICT_SIZE_MAX));
+    }
+
+    fn set_nice_len(&mut self, nice_len: u32) {
+        self.nice_len = Some(nice_len.clamp(Self::NICE_LEN_MIN, Self::NICE_LEN_MAX));
+    }
+
+    /// The dictionary size the encoder will use: the caller's, or the
+    /// level's.
+    pub(crate) fn dict_size(&self) -> u32 {
+        self.dict_size
+            .unwrap_or(Self::LEVEL_DICT_SIZE[self.level as usize])
+    }
+
+    fn nice_len(&self) -> u32 {
+        self.nice_len
+            .unwrap_or(Self::LEVEL_NICE_LEN[self.level as usize])
+    }
+
+    /// The `lzma-turbo` setting.
+    #[cfg(not(feature = "lzma-rust2-encoder"))]
+    pub(crate) fn turbo_props(&self) -> lzma_turbo::LzmaEncProps {
+        use lzma_turbo::MatchFinderKind;
+
+        let fast = self.fast();
+        let mut props = lzma_turbo::LzmaEncProps::new()
+            .with_level(self.level)
+            .with_dict_size(self.dict_size())
+            .with_fast_bytes(self.nice_len())
+            .with_fast_mode(fast)
+            .with_match_finder(if fast {
+                MatchFinderKind::Hc4
+            } else {
+                MatchFinderKind::Bt4
+            });
+        if fast {
+            props = props.with_match_cycles(Self::LEVEL_DEPTH[self.level as usize]);
+        }
+        props
+    }
+
+    /// The `lzma-rust2` setting: its preset for the level, which is this
+    /// table, with the caller's overrides applied.
+    #[cfg(feature = "lzma-rust2-encoder")]
+    pub(crate) fn rust2_options(&self) -> lzma_rust2::LzmaOptions {
+        let mut options = lzma_rust2::LzmaOptions::with_preset(self.level);
+        options.dict_size = self.dict_size();
+        options.nice_len = self.nice_len();
+        options
+    }
+
+    /// The LZMA properties byte, `(pb * 5 + lp) * 9 + lc`. Neither option
+    /// type exposes lc, lp or pb, so both encoders run the defaults of 3, 0
+    /// and 2.
+    pub(crate) const fn props_byte() -> u8 {
+        const LC: u8 = 3;
+        const LP: u8 = 0;
+        const PB: u8 = 2;
+        (PB * 5 + LP) * 9 + LC
+    }
+}
+
 #[cfg(feature = "compress")]
 #[derive(Debug, Clone)]
 /// Options for LZMA compression.
-pub struct LzmaOptions(pub(crate) lzma_rust2::LzmaOptions);
+pub struct LzmaOptions(pub(crate) LzmaSettings);
 
+#[cfg(feature = "compress")]
 impl Default for LzmaOptions {
     fn default() -> Self {
-        Self(lzma_rust2::LzmaOptions::with_preset(6))
+        Self(LzmaSettings::from_level(6))
     }
 }
 
@@ -26,7 +156,7 @@ impl LzmaOptions {
     /// # Arguments
     /// * `level` - Compression level (0-9, clamped to this range)
     pub fn from_level(level: u32) -> Self {
-        Self(lzma_rust2::LzmaOptions::with_preset(level))
+        Self(LzmaSettings::from_level(level))
     }
 
     /// Sets the dictionary size used when encoding.
@@ -36,17 +166,14 @@ impl LzmaOptions {
     /// Encoding returns an invalid-input error for dictionary sizes above 1073741823 bytes
     /// on 64-bit targets or 268435454 bytes on 32-bit targets.
     pub fn set_dictionary_size(&mut self, dict_size: u32) {
-        self.0.dict_size = dict_size.clamp(lzma_rust2::DICT_SIZE_MIN, lzma_rust2::DICT_SIZE_MAX);
+        self.0.set_dict_size(dict_size);
     }
 
     /// Sets the nice length of a match.
     ///
     /// Will be clamped between 8..=273.
     pub fn set_nice_len(&mut self, nice_len: u32) {
-        self.0.nice_len = nice_len.clamp(
-            lzma_rust2::LzmaOptions::NICE_LEN_MIN,
-            lzma_rust2::LzmaOptions::NICE_LEN_MAX,
-        );
+        self.0.set_nice_len(nice_len);
     }
 }
 
@@ -54,15 +181,20 @@ impl LzmaOptions {
 #[derive(Debug, Clone)]
 /// Options for LZMA2 compression.
 pub struct Lzma2Options {
-    pub(crate) options: lzma_rust2::Lzma2Options,
+    pub(crate) settings: LzmaSettings,
     pub(crate) threads: u32,
+    /// How much input one independently compressed block covers when
+    /// `threads` is above one; `None` is one solid stream.
+    pub(crate) chunk_size: Option<NonZeroU64>,
 }
 
+#[cfg(feature = "compress")]
 impl Default for Lzma2Options {
     fn default() -> Self {
         Self {
-            options: lzma_rust2::Lzma2Options::with_preset(6),
+            settings: LzmaSettings::from_level(6),
             threads: 1,
+            chunk_size: None,
         }
     }
 }
@@ -76,8 +208,9 @@ impl Lzma2Options {
     /// * `level` - Compression level (0-9, clamped to this range)
     pub fn from_level(level: u32) -> Self {
         Self {
-            options: lzma_rust2::Lzma2Options::with_preset(level),
+            settings: LzmaSettings::from_level(level),
             threads: 1,
+            chunk_size: None,
         }
     }
 
@@ -92,11 +225,13 @@ impl Lzma2Options {
     ///   the multi threading, but the worse the compression ratio
     ///   will be (value will be clamped to have at least the size of the dictionary).
     pub fn from_level_mt(level: u32, threads: u32, chunk_size: u64) -> Self {
-        let mut options = lzma_rust2::Lzma2Options::with_preset(level);
-        options.set_chunk_size(NonZeroU64::new(
-            chunk_size.max(options.lzma_options.dict_size as u64),
-        ));
-        Self { options, threads }
+        Self {
+            settings: LzmaSettings::from_level(level),
+            threads,
+            // Zero is "the dictionary's size", as it always was:
+            // `block_size` raises anything smaller to the dictionary.
+            chunk_size: NonZeroU64::new(chunk_size.max(1)),
+        }
     }
 
     /// Sets the dictionary size used when encoding.
@@ -106,18 +241,22 @@ impl Lzma2Options {
     /// Encoding returns an invalid-input error for dictionary sizes above 1073741823 bytes
     /// on 64-bit targets or 268435454 bytes on 32-bit targets.
     pub fn set_dictionary_size(&mut self, dict_size: u32) {
-        self.options.lzma_options.dict_size =
-            dict_size.clamp(lzma_rust2::DICT_SIZE_MIN, lzma_rust2::DICT_SIZE_MAX);
+        self.settings.set_dict_size(dict_size);
     }
 
     /// Sets the nice length of a match.
     ///
     /// Will be clamped between 8..=273.
     pub fn set_nice_len(&mut self, nice_len: u32) {
-        self.options.lzma_options.nice_len = nice_len.clamp(
-            lzma_rust2::LzmaOptions::NICE_LEN_MIN,
-            lzma_rust2::LzmaOptions::NICE_LEN_MAX,
-        );
+        self.settings.set_nice_len(nice_len);
+    }
+
+    /// The block size in force: the chunk size, but never below the
+    /// dictionary, so that a block is never smaller than what its coder could
+    /// look back over.
+    pub(crate) fn block_size(&self) -> Option<u64> {
+        self.chunk_size
+            .map(|chunk| chunk.get().max(u64::from(self.settings.dict_size())))
     }
 }
 
@@ -597,9 +736,9 @@ impl EncoderOptions {
     pub fn get_lzma_dict_size(&self) -> u32 {
         match self {
             #[cfg(feature = "compress")]
-            EncoderOptions::Lzma(o) => o.0.dict_size,
+            EncoderOptions::Lzma(o) => o.0.dict_size(),
             #[cfg(feature = "compress")]
-            EncoderOptions::Lzma2(o) => o.options.lzma_options.dict_size,
+            EncoderOptions::Lzma2(o) => o.settings.dict_size(),
             #[allow(unused)]
             _ => 0,
         }

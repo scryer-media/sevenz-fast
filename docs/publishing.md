@@ -51,8 +51,8 @@ which it requests for that job only.
 2. On `main`:
    - set `version` in `Cargo.toml` and refresh `Cargo.lock`;
    - make sure `CHANGELOG.md` has a `## <version>` heading that is not marked
-     unreleased (the `## Fork` section stays where it is; it is the rebase
-     checklist, not a release note);
+     unreleased (the `## Fork` section stays where it is; it is the record of
+     the divergence from sevenz-rust2, not a release note);
    - commit, signed, and push. Wait for `ci` to go green on that commit.
 3. Actions → `release` → Run workflow, branch `main`, the version, and
    `dry_run` left on. The run refuses a branch other than `main`, a version

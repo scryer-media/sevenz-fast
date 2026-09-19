@@ -7,10 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Fork
 
-`sevenz-turbo` is a fork of [sevenz-rust2](https://github.com/hasenbanck/sevenz-rust2)
-taken at upstream `12ed7c8` (post-v0.22.2). This section is the exhaustive list
-of how it differs from that commit, and it is the checklist a rebase is checked
-against. Upstream's own changelog continues below, unchanged.
+`sevenz-turbo` began as a fork of
+[sevenz-rust2](https://github.com/hasenbanck/sevenz-rust2), taken at its
+commit `12ed7c8` (post-v0.22.2). A permanent fork was not the plan: the codec
+swap and the container API were offered to sevenz-rust2 for merging, so that
+one crate could carry both, and the offer was declined - see
+[hasenbanck/sevenz-rust2#144](https://github.com/hasenbanck/sevenz-rust2/issues/144).
+That left a hard fork as the only way to ship the work, and the two crates
+have diverged for good since: this one is not rebased onto sevenz-rust2 and
+nothing goes back. This section is the record of how it differs from the
+commit it was taken at, kept for readers who know the other crate.
+sevenz-rust2's own changelog up to the fork point continues below, unchanged.
 
 ### Packaging
 
@@ -53,10 +60,11 @@ against. Upstream's own changelog continues below, unchanged.
   threads, up to a whole run per worker — spill the excess and copy it a
   second time on the way out. Measured on x86 at eight threads, a gigabyte
   went from 4.82 s to 4.59 s. Needs lzma-turbo 0.3.0 for `drain_upto`.
-- `lzma-rust2` has left the library's runtime dependency graph. It remains an
-  optional dependency behind the `compress` feature, which still uses its LZMA
-  and LZMA2 *encoders*; with `--no-default-features` the graph is
-  `sevenz-turbo → lzma-turbo → crc-fast` and nothing else.
+- `lzma-rust2` has left the dependency graph. Since 0.25.0 archives are
+  written with `lzma-turbo`'s encoder as well, and `lzma-rust2` is reached
+  only through the non-default `lzma-rust2-encoder` feature; with
+  `--no-default-features` the graph is `sevenz-turbo → lzma-turbo → crc-fast`
+  and nothing else.
 - The BCJ and delta filters are `lzma-turbo`'s, and BCJ2 is vendored into
   `src/codec/filter/` from `lzma-rust2` 0.20.1 (Apache-2.0, same licence),
   which together are what let `lzma-rust2` leave the decode graph rather than
@@ -375,6 +383,31 @@ Everything here is new surface; no upstream signature changed meaning.
 - The vendored BCJ round-trip tests generate their sample data instead of
   reading the binary fixtures `lzma-rust2` keeps in its repository, which are
   not ours to vendor.
+
+## 0.25.0 - 2026-09-19
+
+- LZMA and LZMA2 are encoded by `lzma-turbo`'s port of the SDK encoder.
+  `compress` no longer pulls `lzma-rust2`; the archive writer's LZMA (`03 01
+  01`) and LZMA2 (`21`) coders are `src/codec/lzma_turbo/writer.rs`, a `Write`
+  over `lzma-turbo`'s pull-driven encoders. The encoder runs on a thread,
+  pulling from a bounded channel the writer feeds, so an entry of any size
+  streams through it with a bounded amount in flight; where no thread can be
+  started (`wasm32-unknown-unknown`) the writer holds the input and encodes
+  it on finish, producing the same bytes. `Lzma2Options::from_level_mt`'s
+  threads and chunk size are `lzma-turbo`'s block threads and block size.
+- New feature `lzma-rust2-encoder`, off by default: encode LZMA and LZMA2
+  with `lzma-rust2`'s pure-Rust encoders instead, as every earlier version
+  did. `LzmaOptions` and `Lzma2Options` are the same types either way; they
+  now hold their own level, dictionary and nice length rather than wrapping
+  `lzma-rust2`'s option types, and a level means the same dictionary under
+  both encoders: the table `lzma-rust2` and xz use, 256 KiB at level 0 to
+  64 MiB at level 9, rather than the SDK's own level defaults. The public
+  API does not change.
+- Requires `lzma-turbo` 0.4.0 with its `enc` feature.
+- Fixed: the LZMA2 property byte for a dictionary that is not a power of
+  two or three times one was rounded down (5 MiB was written as 4 MiB) while
+  the encoder used the full window, so a reader could hit a match beyond its
+  dictionary. It is now rounded up, as `Lzma2Enc_WriteProperties` does.
 
 ## 0.24.0 - 2026-09-18
 
