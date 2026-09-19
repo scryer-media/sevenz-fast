@@ -273,7 +273,7 @@ impl Aes256CbcLike for RustCryptoAes256Cbc {
     allow(dead_code)
 )]
 pub(crate) struct HostAes256Cbc {
-    key: [u8; AES256_KEY_LEN],
+    key: zeroize::Zeroizing<[u8; AES256_KEY_LEN]>,
     iv: [u8; AES_BLOCK_LEN],
 }
 
@@ -288,7 +288,9 @@ impl std::fmt::Debug for HostAes256Cbc {
 #[cfg(feature = "crypto-host")]
 impl Aes256CbcLike for HostAes256Cbc {
     fn new(key: &[u8], iv: &[u8]) -> Result<Self, AesError> {
-        let key: [u8; AES256_KEY_LEN] = key.try_into().map_err(|_| AesError::KeyLength)?;
+        let key = zeroize::Zeroizing::new(
+            <[u8; AES256_KEY_LEN]>::try_from(key).map_err(|_| AesError::KeyLength)?,
+        );
         let iv: [u8; AES_BLOCK_LEN] = iv.try_into().map_err(|_| AesError::IvLength)?;
         Ok(Self { key, iv })
     }
@@ -311,8 +313,8 @@ impl Aes256CbcLike for HostAes256Cbc {
         // is nothing to fall back to and nothing to report up the stack that a
         // caller could act on, so it panics rather than corrupting a decode.
         let hooks = crate::hooks::hooks();
-        let plaintext = match (hooks.aes_cbc_decrypt)(&self.key, &self.iv, data) {
-            Ok(plaintext) => plaintext,
+        let plaintext = match (hooks.aes_cbc_decrypt)(self.key.as_ref(), &self.iv, data) {
+            Ok(plaintext) => zeroize::Zeroizing::new(plaintext),
             Err(err) => {
                 panic!("sevenz-turbo: host aes-cbc-decrypt failed: {err} (contract violation)")
             }
@@ -395,6 +397,13 @@ impl_sha256_like!(lzma_turbo::crypto::rustcrypto::Sha256);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(feature = "native-crypto", feature = "compress"))]
+    #[test]
+    fn aes_key_schedules_are_cleared_on_drop() {
+        fn requires_clearing<T: zeroize::ZeroizeOnDrop>() {}
+        requires_clearing::<aes::Aes256>();
+    }
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()

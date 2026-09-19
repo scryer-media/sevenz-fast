@@ -16,13 +16,30 @@ use crate::*;
 /// * `f` - JavaScript callback function to handle extracted entries
 #[wasm_bindgen]
 pub fn decompress(src: Uint8Array, pwd: &str, f: &Function) -> Result<(), String> {
+    decompress_with_limits(src, pwd, f, ArchiveLimits::default())
+}
+
+/// Returns the default limits, with mutable fields for JavaScript callers.
+#[wasm_bindgen]
+pub fn default_archive_limits() -> ArchiveLimits {
+    ArchiveLimits::default()
+}
+
+/// Decompresses with explicit allocation, output and key-derivation limits.
+#[wasm_bindgen]
+pub fn decompress_with_limits(
+    src: Uint8Array,
+    pwd: &str,
+    f: &Function,
+    limits: ArchiveLimits,
+) -> Result<(), String> {
     let mut src_reader = Uint8ArrayStream::new(src);
     let pos = src_reader.stream_position().map_err(|e| e.to_string())?;
     src_reader
         .seek(SeekFrom::Start(pos))
         .map_err(|e| e.to_string())?;
-    let mut seven =
-        ArchiveReader::new(src_reader, Password::from(pwd)).map_err(|e| e.to_string())?;
+    let mut seven = ArchiveReader::with_limits(src_reader, Password::from(pwd), limits)
+        .map_err(|e| e.to_string())?;
     seven
         .for_each_entries(|entry, reader| {
             if !entry.is_directory() {
@@ -53,6 +70,9 @@ pub fn decompress(src: Uint8Array, pwd: &str, f: &Function) -> Result<(), String
 fn sanitize_entry_name(entry_name: &str) -> Result<String, String> {
     use std::path::{Component, Path, PathBuf};
 
+    if let Some(reason) = crate::archive::unsafe_path_reason(entry_name) {
+        return Err(format!("unsafe entry path: {reason}"));
+    }
     let normalized = entry_name.replace('\\', "/");
     let mut result = PathBuf::new();
     for component in Path::new(&normalized).components() {
@@ -65,6 +85,9 @@ fn sanitize_entry_name(entry_name: &str) -> Result<String, String> {
                 ));
             }
         }
+    }
+    if result.as_os_str().is_empty() {
+        return Err("entry path has no normal components".into());
     }
     Ok(result.to_string_lossy().into_owned())
 }
@@ -184,5 +207,35 @@ impl Write for Uint8ArrayStream {
 
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::sanitize_entry_name;
+
+    #[test]
+    fn rejects_names_unsafe_for_host_filesystems() {
+        for name in [
+            "C:/outside/file",
+            "C:relative",
+            "C:\\outside\\file",
+            "",
+            ".",
+            "./",
+            "dir/\0file",
+            "../file",
+            "/file",
+            "\\\\server\\share",
+        ] {
+            assert!(sanitize_entry_name(name).is_err(), "accepted {name:?}");
+        }
+    }
+
+    #[test]
+    fn normalizes_safe_relative_names() {
+        for name in ["dir/file", "./dir/file", "dir\\file"] {
+            assert_eq!(sanitize_entry_name(name).unwrap(), "dir/file");
+        }
     }
 }

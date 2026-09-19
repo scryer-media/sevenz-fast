@@ -603,6 +603,7 @@ impl Archive {
             }
         }
 
+        archive.check_aes_work(opts.limits)?;
         archive.is_solid = archive
             .blocks
             .iter()
@@ -620,6 +621,7 @@ impl Archive {
         opts: &DecodeOptions<'_>,
     ) -> Result<(Box<dyn Read + 'r>, usize), Error> {
         Self::read_streams_info(header, archive, bounds)?;
+        archive.check_aes_work(opts.limits)?;
         let block = archive
             .blocks
             .first()
@@ -1151,10 +1153,8 @@ impl Archive {
                 block.num_unpack_sub_streams = num_streams;
                 // Each sub-stream still consumes header bytes downstream, so the running
                 // total stays bounded by `limit`; reject anything larger up front.
-                total_unpack_streams += num_streams;
-                if total_unpack_streams > bounds.bytes {
-                    return Err(Error::other("total unpack streams exceeds available input"));
-                }
+                // C: CInArchive::ReadSubStreamsInfo checks the running sum.
+                total_unpack_streams = bounds.add_count(total_unpack_streams, num_streams)?;
             }
             nid = header.read_u8()?;
         }
@@ -1197,10 +1197,13 @@ impl Archive {
             nid = header.read_u8()?;
         }
 
-        let mut num_digests = 0;
+        let mut num_digests = 0usize;
         for block in archive.blocks.iter() {
             if block.num_unpack_sub_streams != 1 || !block.has_crc {
-                num_digests += block.num_unpack_sub_streams;
+                num_digests = num_digests
+                    .checked_add(block.num_unpack_sub_streams)
+                    .filter(|total| *total <= total_unpack_streams)
+                    .ok_or_else(|| Error::other("sub-stream digest count out of range"))?;
             }
         }
 
@@ -1505,6 +1508,13 @@ impl<'a> HeaderBounds<'a> {
         }
         // Bounded by `self.bytes`, which is a `usize`.
         Ok(value as usize)
+    }
+
+    fn add_count(self, total: usize, additional: usize) -> Result<usize, Error> {
+        let total = total
+            .checked_add(additional)
+            .ok_or_else(|| Error::other("total unpack streams overflow"))?;
+        self.count(total as u64, Limit::Entries)
     }
 
     /// Checks a size in bytes that the header goes on to spend on itself.
@@ -1982,6 +1992,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
         opts: &DecodeOptions<'_>,
     ) -> Result<(Box<dyn Read + 'r>, usize), Error> {
         let block = &archive.blocks[block_index];
+        crate::container::check_aes_coders(block.coders.iter(), opts.limits)?;
         if block.total_input_streams > block.total_output_streams {
             return Self::build_decode_stack2(source, archive, block_index, password, opts);
         }
@@ -2799,5 +2810,36 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
             return vec![u64::MAX];
         }
         offsets
+    }
+}
+
+#[cfg(test)]
+mod count_limit_tests {
+    use super::*;
+
+    #[test]
+    fn aggregate_counts_check_overflow_and_both_limits() {
+        let limits = ArchiveLimits {
+            max_entries: 10,
+            ..ArchiveLimits::default()
+        };
+        let bounds = HeaderBounds::new(20, &limits);
+        assert_eq!(bounds.add_count(4, 6).unwrap(), 10);
+        assert_eq!(
+            bounds.add_count(5, 6).unwrap_err().limit_hit(),
+            Some(Limit::Entries)
+        );
+        assert_eq!(
+            HeaderBounds::new(8, &limits)
+                .add_count(4, 5)
+                .unwrap_err()
+                .limit_hit(),
+            Some(Limit::ArchiveBytes)
+        );
+        assert!(
+            HeaderBounds::new(usize::MAX, &ArchiveLimits::unlimited())
+                .add_count(usize::MAX, 1)
+                .is_err()
+        );
     }
 }

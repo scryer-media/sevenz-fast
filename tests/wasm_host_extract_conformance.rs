@@ -261,20 +261,14 @@ fn fixture_entries() -> Vec<(&'static str, Vec<u8>)> {
     ]
 }
 
-/// Written once per test binary, for the same reason the wasm build is: two
-/// tests writing the same archive in parallel would race, and one could read a
-/// half-written file.
-static FIXTURE_DIR: LazyLock<PathBuf> = LazyLock::new(write_fixture);
-
 /// Write the AES-256 encrypted fixture archive with this crate's own encoder,
 /// and return the directory holding it (which the guest gets preopened).
-fn write_fixture() -> PathBuf {
+fn write_fixture() -> tempfile::TempDir {
     use sevenz_turbo::encoder_options::{AesEncoderOptions, Lzma2Options};
     use sevenz_turbo::{ArchiveEntry, ArchiveWriter, Password};
 
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("wasm-host-conformance-fixture");
-    std::fs::create_dir_all(&dir).expect("create the fixture directory");
-    let path = dir.join("archive.7z");
+    let dir = tempfile::tempdir().expect("create a private fixture directory");
+    let path = dir.path().join("archive.7z");
 
     let file = std::fs::File::create(&path).expect("create the fixture archive");
     let mut writer = ArchiveWriter::new(file).expect("open an archive writer");
@@ -390,7 +384,8 @@ fn wasm_guest_extraction_matches_the_native_decoder() {
         return;
     }
 
-    let fixture_dir = FIXTURE_DIR.as_path();
+    let fixture = write_fixture();
+    let fixture_dir = fixture.path();
     let expected = native_extraction(&fixture_dir.join("archive.7z"));
     assert_eq!(
         expected.len(),
@@ -432,7 +427,12 @@ fn a_guest_without_hooks_panics_with_the_documented_message() {
         return;
     }
 
-    let run = run_guest(&CONFORMANCE_WASM, &FIXTURE_DIR, Some("--skip-hook-install"));
+    let fixture = write_fixture();
+    let run = run_guest(
+        &CONFORMANCE_WASM,
+        fixture.path(),
+        Some("--skip-hook-install"),
+    );
 
     assert!(
         run.outcome.is_err(),

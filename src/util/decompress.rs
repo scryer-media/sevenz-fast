@@ -48,7 +48,7 @@ pub fn decompress_file_with_extract_fn(
 /// * `src_reader` - Reader containing the archive data
 /// * `dest` - Path to the destination directory where files will be extracted
 pub fn decompress<R: Read + Seek>(src_reader: R, dest: impl AsRef<Path>) -> Result<(), Error> {
-    decompress_with_extract_fn(src_reader, dest, default_entry_extract_fn)
+    decompress_with_limits(src_reader, dest, ArchiveLimits::default())
 }
 
 /// Decompresses an archive from a reader to a destination directory with a custom extraction function.
@@ -65,7 +65,13 @@ pub fn decompress_with_extract_fn<R: Read + Seek>(
     dest: impl AsRef<Path>,
     extract_fn: impl FnMut(&ArchiveEntry, &mut dyn Read, &PathBuf) -> Result<bool, Error>,
 ) -> Result<(), Error> {
-    decompress_impl(src_reader, dest, Password::empty(), extract_fn)
+    decompress_impl(
+        src_reader,
+        dest,
+        Password::empty(),
+        ArchiveLimits::default(),
+        extract_fn,
+    )
 }
 
 /// Decompresses an encrypted archive file with the given password.
@@ -97,7 +103,7 @@ pub fn decompress_with_password<R: Read + Seek>(
     dest: impl AsRef<Path>,
     password: Password,
 ) -> Result<(), Error> {
-    decompress_impl(src_reader, dest, password, default_entry_extract_fn)
+    decompress_default(src_reader, dest, password, ArchiveLimits::default())
 }
 
 /// Decompresses an encrypted archive from a reader with a custom extraction function and password.
@@ -117,7 +123,94 @@ pub fn decompress_with_extract_fn_and_password<R: Read + Seek>(
     password: Password,
     extract_fn: impl FnMut(&ArchiveEntry, &mut dyn Read, &PathBuf) -> Result<bool, Error>,
 ) -> Result<(), Error> {
-    decompress_impl(src_reader, dest, password, extract_fn)
+    decompress_impl(
+        src_reader,
+        dest,
+        password,
+        ArchiveLimits::default(),
+        extract_fn,
+    )
+}
+
+/// [`decompress`] with explicit limits, checked before allocation and extraction.
+pub fn decompress_with_limits<R: Read + Seek>(
+    src_reader: R,
+    dest: impl AsRef<Path>,
+    limits: ArchiveLimits,
+) -> Result<(), Error> {
+    decompress_default(src_reader, dest, Password::empty(), limits)
+}
+
+/// [`decompress_file`] with explicit limits, checked before allocation and extraction.
+pub fn decompress_file_with_limits(
+    src_path: impl AsRef<Path>,
+    dest: impl AsRef<Path>,
+    limits: ArchiveLimits,
+) -> Result<(), Error> {
+    let src_reader = std::fs::File::open(src_path.as_ref())
+        .map_err(|e| Error::file_open(e, src_path.as_ref().to_string_lossy().to_string()))?;
+    decompress_default(src_reader, dest, Password::empty(), limits)
+}
+
+/// [`decompress_with_extract_fn`] with explicit limits, checked before allocation and extraction.
+/// The callback owns filesystem safety for any writes it performs.
+pub fn decompress_with_extract_fn_and_limits<R: Read + Seek>(
+    src_reader: R,
+    dest: impl AsRef<Path>,
+    limits: ArchiveLimits,
+    extract_fn: impl FnMut(&ArchiveEntry, &mut dyn Read, &PathBuf) -> Result<bool, Error>,
+) -> Result<(), Error> {
+    decompress_impl(src_reader, dest, Password::empty(), limits, extract_fn)
+}
+
+/// [`decompress_file_with_extract_fn`] with explicit limits, checked before allocation and extraction.
+/// The callback owns filesystem safety for any writes it performs.
+pub fn decompress_file_with_extract_fn_and_limits(
+    src_path: impl AsRef<Path>,
+    dest: impl AsRef<Path>,
+    limits: ArchiveLimits,
+    extract_fn: impl FnMut(&ArchiveEntry, &mut dyn Read, &PathBuf) -> Result<bool, Error>,
+) -> Result<(), Error> {
+    let src_reader = std::fs::File::open(src_path.as_ref())
+        .map_err(|e| Error::file_open(e, src_path.as_ref().to_string_lossy().to_string()))?;
+    decompress_impl(src_reader, dest, Password::empty(), limits, extract_fn)
+}
+
+/// [`decompress_with_password`] with explicit limits, checked before allocation and extraction.
+#[cfg(feature = "aes256")]
+pub fn decompress_with_password_and_limits<R: Read + Seek>(
+    src_reader: R,
+    dest: impl AsRef<Path>,
+    password: Password,
+    limits: ArchiveLimits,
+) -> Result<(), Error> {
+    decompress_default(src_reader, dest, password, limits)
+}
+
+/// [`decompress_file_with_password`] with explicit limits, checked before allocation and extraction.
+#[cfg(feature = "aes256")]
+pub fn decompress_file_with_password_and_limits(
+    src_path: impl AsRef<Path>,
+    dest: impl AsRef<Path>,
+    password: Password,
+    limits: ArchiveLimits,
+) -> Result<(), Error> {
+    let src_reader = std::fs::File::open(src_path.as_ref())
+        .map_err(|e| Error::file_open(e, src_path.as_ref().to_string_lossy().to_string()))?;
+    decompress_default(src_reader, dest, password, limits)
+}
+
+/// [`decompress_with_extract_fn_and_password`] with explicit limits, checked before allocation and extraction.
+/// The callback owns filesystem safety for any writes it performs.
+#[cfg(feature = "aes256")]
+pub fn decompress_with_extract_fn_and_password_and_limits<R: Read + Seek>(
+    src_reader: R,
+    dest: impl AsRef<Path>,
+    password: Password,
+    limits: ArchiveLimits,
+    extract_fn: impl FnMut(&ArchiveEntry, &mut dyn Read, &PathBuf) -> Result<bool, Error>,
+) -> Result<(), Error> {
+    decompress_impl(src_reader, dest, password, limits, extract_fn)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -125,13 +218,14 @@ fn decompress_impl<R: Read + Seek>(
     mut src_reader: R,
     dest: impl AsRef<Path>,
     password: Password,
+    limits: ArchiveLimits,
     mut extract_fn: impl FnMut(&ArchiveEntry, &mut dyn Read, &PathBuf) -> Result<bool, Error>,
 ) -> Result<(), Error> {
     use std::io::SeekFrom;
 
     let pos = src_reader.stream_position()?;
     src_reader.seek(SeekFrom::Start(pos))?;
-    let mut seven = ArchiveReader::new(src_reader, password)?;
+    let mut seven = ArchiveReader::with_limits(src_reader, password, limits)?;
     let dest = PathBuf::from(dest.as_ref());
     if !dest.exists() {
         std::fs::create_dir_all(&dest)?;
@@ -153,6 +247,12 @@ fn decompress_impl<R: Read + Seek>(
 fn safe_join(dest: &Path, entry_name: &str) -> Result<PathBuf, Error> {
     use std::path::Component;
 
+    if let Some(reason) = crate::archive::unsafe_path_reason(entry_name) {
+        return Err(Error::UnsafeEntryName {
+            name: entry_name.to_owned(),
+            reason,
+        });
+    }
     // Treat backslashes as separators too, so `..\..\x` from a Windows-authored
     // archive is caught when extracting on Unix.
     let normalized = entry_name.replace('\\', "/");
@@ -168,71 +268,194 @@ fn safe_join(dest: &Path, entry_name: &str) -> Result<PathBuf, Error> {
             }
         }
     }
+    if result == dest {
+        return Err(Error::other("entry path has no normal components"));
+    }
     Ok(result)
 }
 
 /// Default extraction function that handles standard file and directory extraction.
 ///
 /// # Security
-/// `dest` must already be a path you have validated as staying inside your destination
-/// directory. This function only rejects `..` components as a last line of defense;
-/// because it receives the already-joined path it cannot detect an absolute entry name
-/// that discarded the destination root (`root.join("/etc/x")` == `/etc/x`), so do not
-/// build `dest` with `root.join(entry.name())`. Prefer the higher-level [`decompress`]
-/// helpers, which perform the full traversal check for you.
+/// `dest` must end in the validated archive entry name; its preceding path
+/// selects the trusted extraction root. Existing symlinks below that root are
+/// rejected and filesystem operations are confined to a directory handle.
+/// Prefer [`decompress`] to keep one root handle open for the whole archive.
+/// Custom callbacks that write files remain responsible for their own safety.
 ///
 /// # Arguments
 /// * `entry` - Archive entry being processed
 /// * `reader` - Reader for the entry's data
 /// * `dest` - Destination path for the entry (already validated by the caller)
 #[cfg(not(target_arch = "wasm32"))]
+#[allow(clippy::ptr_arg)] // Preserve the upstream callback signature.
 pub fn default_entry_extract_fn(
     entry: &ArchiveEntry,
     reader: &mut dyn Read,
     dest: &PathBuf,
 ) -> Result<bool, Error> {
-    use std::{fs::File, io::BufWriter, path::Component};
-
-    // Reject any `..` component so a relative-traversal path can never reach a write.
-    // (An absolute escape cannot be detected here, as the destination root is unknown.)
-    if dest.components().any(|c| c == Component::ParentDir) {
-        return Err(Error::other(format!(
-            "unsafe entry path contains a parent-directory component: {}",
-            dest.to_string_lossy()
-        )));
+    if dest
+        .components()
+        .any(|part| part == std::path::Component::ParentDir)
+    {
+        return Err(Error::other(
+            "unsafe destination contains a parent-directory component",
+        ));
     }
+    // Recover the caller-selected root only when the supplied path ends in the
+    // validated archive name. Custom renaming should use a custom callback.
+    let relative = safe_join(Path::new(""), entry.name())?;
+    if !dest.ends_with(&relative) {
+        return Err(Error::other(
+            "destination does not end in the archive entry path",
+        ));
+    }
+    let mut root = dest.clone();
+    for _ in relative.components() {
+        root.pop();
+    }
+    let root = open_extract_root(&root)?;
+    extract_in_root(&root, entry, reader, &relative)
+}
 
-    if entry.is_directory() {
-        let dir = dest;
-        if !dir.exists() {
-            std::fs::create_dir_all(dir)?;
-        }
+fn open_extract_root(dest: &Path) -> Result<cap_std::fs::Dir, Error> {
+    let dest = if dest.as_os_str().is_empty() {
+        Path::new(".")
     } else {
-        let path = dest;
-        path.parent().and_then(|p| {
-            if !p.exists() {
-                std::fs::create_dir_all(p).ok()
-            } else {
-                None
+        dest
+    };
+    // Only the caller-selected root uses ambient authority. Every archive
+    // component is resolved relative to the directory handle below.
+    std::fs::create_dir_all(dest)?;
+    Ok(cap_std::fs::Dir::open_ambient_dir(
+        dest,
+        cap_std::ambient_authority(),
+    )?)
+}
+
+fn decompress_default<R: Read + Seek>(
+    src_reader: R,
+    dest: impl AsRef<Path>,
+    password: Password,
+    limits: ArchiveLimits,
+) -> Result<(), Error> {
+    let mut seven = ArchiveReader::with_limits(src_reader, password, limits)?;
+    let root = open_extract_root(dest.as_ref())?;
+    seven.for_each_entries(|entry, reader| {
+        let relative = safe_join(Path::new(""), entry.name())?;
+        extract_in_root(&root, entry, reader, &relative)
+    })
+}
+
+fn extract_in_root(
+    root: &cap_std::fs::Dir,
+    entry: &ArchiveEntry,
+    reader: &mut dyn Read,
+    relative: &Path,
+) -> Result<bool, Error> {
+    use std::io::{BufWriter, ErrorKind, Write};
+
+    // Reject existing links, including links to locations within the root.
+    // This check sets policy; cap-std provides confinement if the tree changes
+    // between the check and any later operation.
+    let mut prefix = PathBuf::new();
+    for part in relative.components() {
+        prefix.push(part);
+        match root.symlink_metadata(&prefix) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(Error::other("symbolic link in extraction path"));
             }
-        });
-        let file = File::create(path)
-            .map_err(|e| Error::file_open(e, path.to_string_lossy().to_string()))?;
-        if entry.size() > 0 {
-            let mut writer = BufWriter::new(file);
-            std::io::copy(reader, &mut writer)?;
+            Ok(_) => {}
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    if entry.is_directory() {
+        root.create_dir_all(relative)?;
+        return Ok(true);
+    }
+    if let Some(parent) = relative.parent().filter(|p| !p.as_os_str().is_empty()) {
+        root.create_dir_all(parent)?;
+    }
+    // Replace the directory entry instead of truncating an existing inode.
+    // This also avoids modifying data through a pre-existing hard link.
+    match root.remove_file(relative) {
+        Ok(()) => {}
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    let file = root
+        .open_with(
+            relative,
+            cap_std::fs::OpenOptions::new().write(true).create_new(true),
+        )?
+        .into_std();
+    let mut writer = BufWriter::new(file);
+    std::io::copy(reader, &mut writer)?;
+    writer.flush()?;
+    let file_times = FileTimes::new()
+        .set_accessed(entry.access_date().into())
+        .set_modified(entry.last_modified_date().into());
+    #[cfg(any(windows, target_os = "macos"))]
+    let file_times = file_times.set_created(entry.creation_date().into());
+    let _ = writer.get_ref().set_times(file_times);
+    Ok(true)
+}
 
-            let file = writer.get_mut();
-            let file_times = FileTimes::new()
-                .set_accessed(entry.access_date().into())
-                .set_modified(entry.last_modified_date().into());
+#[cfg(test)]
+mod confinement_tests {
+    use super::*;
 
-            #[cfg(any(windows, target_os = "macos"))]
-            let file_times = file_times.set_created(entry.creation_date().into());
-
-            let _ = file.set_times(file_times);
+    #[test]
+    fn normal_files_replace_entries_and_nested_directories_work() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = open_extract_root(temp.path()).unwrap();
+        let entry = ArchiveEntry::new_file("nested/file");
+        for data in [b"first".as_slice(), b"next".as_slice()] {
+            extract_in_root(&root, &entry, &mut &data[..], Path::new(entry.name())).unwrap();
+            assert_eq!(root.read(entry.name()).unwrap(), data);
         }
     }
 
-    Ok(true)
+    #[cfg(unix)]
+    #[test]
+    fn existing_links_are_rejected_at_every_position() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = open_extract_root(temp.path()).unwrap();
+        root.create_dir("real").unwrap();
+        root.write("real/file", b"unchanged").unwrap();
+        root.symlink("real", "linked-directory").unwrap();
+        root.symlink("real/file", "linked-file").unwrap();
+        for name in ["linked-directory/file", "linked-file"] {
+            let entry = ArchiveEntry::new_file(name);
+            assert!(extract_in_root(&root, &entry, &mut &b"data"[..], Path::new(name)).is_err());
+        }
+        assert_eq!(root.read("real/file").unwrap(), b"unchanged");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extraction_keeps_the_opened_root_when_its_name_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let original = temp.path().join("original");
+        let renamed = temp.path().join("renamed");
+        let root = open_extract_root(&original).unwrap();
+        std::fs::rename(&original, &renamed).unwrap();
+        std::fs::create_dir(&original).unwrap();
+        let entry = ArchiveEntry::new_file("file");
+        extract_in_root(&root, &entry, &mut &b"data"[..], Path::new("file")).unwrap();
+        assert_eq!(std::fs::read(renamed.join("file")).unwrap(), b"data");
+        assert!(!original.join("file").exists());
+    }
+
+    #[test]
+    fn paths_require_a_relative_normal_component() {
+        for name in ["", ".", "./", "C:/file", "../file", "/file"] {
+            assert!(safe_join(Path::new("root"), name).is_err());
+        }
+        assert_eq!(
+            safe_join(Path::new("root"), "dir/file").unwrap(),
+            Path::new("root/dir/file")
+        );
+    }
 }

@@ -166,6 +166,8 @@ pub enum Limit {
     UnpackRatio,
     /// `max_aes_cycles_power`, as the exponent itself.
     AesCyclesPower,
+    /// `max_aes_kdf_rounds`, across the archive and encoded header.
+    AesKdfRounds,
     /// The archive's own structure, rather than a caller's limit: a count,
     /// size or offset that the bytes present cannot possibly support.
     ///
@@ -194,6 +196,7 @@ impl Limit {
             Self::UnpackBytes => "max_unpack_bytes",
             Self::UnpackRatio => "max_unpack_ratio",
             Self::AesCyclesPower => "max_aes_cycles_power",
+            Self::AesKdfRounds => "max_aes_kdf_rounds",
             Self::ArchiveBytes => "the bytes the archive has",
         }
     }
